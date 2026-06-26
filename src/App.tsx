@@ -1502,7 +1502,7 @@ export default function App() {
           {previewFile && (
             <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setPreviewFile(null)} className="absolute inset-0 bg-black/80 backdrop-blur-sm" />
-              <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="relative z-10 bg-white dark:bg-slate-900 rounded-[2rem] shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden">
+              <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="relative z-10 bg-white dark:bg-slate-900 rounded-[2rem] shadow-2xl w-full max-w-6xl h-[90vh] flex flex-col overflow-hidden">
                 <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 dark:border-slate-800 shrink-0">
                   <div className="flex items-center gap-3 overflow-hidden">
                     <FileIcon file={previewFile} type={previewFile.type} isTg={previewFile.isTgDrive} accountId={selectedAccountId} />
@@ -1517,15 +1517,17 @@ export default function App() {
                     <button onClick={() => setPreviewFile(null)} className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all"><X size={18} /></button>
                   </div>
                 </div>
-                <div className="flex-1 overflow-auto flex items-center justify-center p-6 bg-slate-50 dark:bg-slate-950 min-h-[300px]">
+                <div className="flex-1 overflow-hidden flex items-center justify-center bg-slate-50 dark:bg-slate-950">
                   {previewFile.type === 'image' ? (
-                    <img src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} alt={previewFile.name} className="max-w-full max-h-[60vh] rounded-xl shadow-lg object-contain" />
+                    <img src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} alt={previewFile.name} className="w-full h-full object-contain" />
                   ) : previewFile.type === 'video' ? (
-                    <video controls autoPlay className="max-w-full max-h-[60vh] rounded-xl shadow-lg" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
+                    <video controls autoPlay className="w-full h-full outline-none" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
                   ) : previewFile.type === 'audio' ? (
-                    <audio controls autoPlay className="w-full max-w-md" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
-                  ) : previewFile.type === 'pdf' && previewFile.webViewLink && !previewFile.isTgDrive ? (
-                    <iframe src={previewFile.url || previewFile.webViewLink} className="w-full h-[60vh] rounded-xl border border-slate-200 dark:border-slate-700" title={previewFile.name} />
+                    <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-900 dark:to-slate-950">
+                      <audio controls autoPlay className="w-full max-w-md shadow-2xl rounded-full" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
+                    </div>
+                  ) : previewFile.type === 'pdf' && (previewFile.url || (previewFile.webViewLink && !previewFile.isTgDrive)) ? (
+                    <iframe src={previewFile.url || previewFile.webViewLink} className="w-full h-full border-0" title={previewFile.name} />
                   ) : (
                     <div className="text-center space-y-6">
                       <div className="w-20 h-20 mx-auto"><FileIcon file={previewFile} type={previewFile.type} size="lg" isTg={previewFile.isTgDrive} accountId={selectedAccountId} /></div>
