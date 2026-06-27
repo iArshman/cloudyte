@@ -1254,13 +1254,9 @@ export default function App() {
                 <div className="flex items-center gap-1 sm:gap-2 shrink-0">
                   <button onClick={handleBulkZipToCloud} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Zip to Cloud"><FileArchive size={18} /></button>
                   
-                  {!isSingleFile && (
-                    <button onClick={handleBulkZip} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Download as Zip"><Archive size={18} /></button>
-                  )}
-                  
-                  {isSingleFile && (
-                    <button onClick={() => handleDownload(selectedFilesList[0].id)} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Download"><Download size={18} /></button>
-                  )}
+                  <button onClick={!isSingleFile ? handleBulkZip : () => handleDownload(selectedFilesList[0].id)} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title={!isSingleFile ? "Download as Zip" : "Download"}>
+                    {!isSingleFile ? <Archive size={18} /> : <Download size={18} />}
+                  </button>
                   
                   <button onClick={handleOpenMoveModal} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Move"><Folder size={18} /></button>
                   <button onClick={handleBulkDelete} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-red-400 transition-all border border-transparent hover:border-slate-700 shrink-0" title="Delete"><Trash2 size={18} /></button>
@@ -1767,21 +1763,16 @@ export default function App() {
                 </button>
               )}
 
-              <div className="relative w-full h-full max-w-7xl flex flex-col items-center justify-center p-4 sm:p-12" onClick={e => e.stopPropagation()}>
+              <div className="relative w-full h-full flex flex-col items-center justify-center" onClick={e => e.stopPropagation()}>
                 {fullScreenGalleryFile.type === 'image' && (
-                  <img src={getMediaUrl(fullScreenGalleryFile)} className="max-w-full max-h-[85vh] object-contain shadow-2xl" alt={fullScreenGalleryFile.name} />
+                  <img src={getMediaUrl(fullScreenGalleryFile)} className="w-full h-full object-contain" alt={fullScreenGalleryFile.name} />
                 )}
                 {fullScreenGalleryFile.type === 'video' && (
-                  <video src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="max-w-full max-h-[85vh] shadow-2xl" />
+                  <video src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="w-full h-full" />
                 )}
                 {fullScreenGalleryFile.type === 'audio' && (
                   <audio src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="w-full max-w-xl shadow-2xl" />
                 )}
-                <div className="absolute bottom-8 inset-x-0 flex justify-center">
-                  <div className="bg-black/50 backdrop-blur-md px-6 py-3 rounded-2xl">
-                    <p className="text-white text-center font-bold text-sm sm:text-base tracking-wide">{fullScreenGalleryFile.name}</p>
-                  </div>
-                </div>
               </div>
 
               {hasNextMedia && (
