@@ -4,7 +4,7 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initBot } from './telegram';
+import { initBot } from './telegram.ts';
 import { google } from 'googleapis';
 import { MongoClient, ObjectId } from 'mongodb';
 import multer from 'multer';
