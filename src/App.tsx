@@ -526,12 +526,13 @@ export default function App() {
     setSelectedFileIds(new Set());
   };
 
-  const handleBulkZipToCloud = async () => {
-    if (selectedFileIds.size === 0) return;
+  const handleBulkZipToCloud = async (specificIds?: Set<string>) => {
+    const idsToProcess = specificIds || selectedFileIds;
+    if (idsToProcess.size === 0) return;
     showToast('Preparing ZIP archive to save here...', 'success');
     try {
       const zip = new JSZip();
-      for (const id of selectedFileIds) {
+      for (const id of idsToProcess) {
         const file = files.find(f => f.id === id);
         if (!file || file.type === 'folder') continue;
         
@@ -555,7 +556,7 @@ export default function App() {
       const zipFile = new File([content], `archive_${Date.now()}.zip`, { type: 'application/zip' });
       showToast('Uploading ZIP archive to current folder...');
       await uploadFiles([zipFile] as any);
-      setSelectedFileIds(new Set());
+      if (!specificIds) setSelectedFileIds(new Set());
     } catch (err: any) {
       showToast('Failed to create ZIP: ' + err.message, 'error');
     }
@@ -565,6 +566,26 @@ export default function App() {
     const token = localStorage.getItem('cloudyte_token');
     const url = `/api/download/${selectedAccountId}/${file.id}?preview=1&token=${token}`;
     setPreviewFile({ ...file, url });
+  };
+
+  const [touchStart, setTouchStart] = useState<number | null>(null);
+  const [touchEnd, setTouchEnd] = useState<number | null>(null);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    setTouchEnd(null);
+    setTouchStart(e.targetTouches[0].clientX);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    setTouchEnd(e.targetTouches[0].clientX);
+  };
+
+  const handleTouchEnd = () => {
+    if (!touchStart || !touchEnd) return;
+    const distance = touchStart - touchEnd;
+    const minSwipeDistance = 50;
+    if (distance > minSwipeDistance && hasNextMedia) navigateGallery('next');
+    if (distance < -minSwipeDistance && hasPrevMedia) navigateGallery('prev');
   };
 
   const openFullScreenGallery = (file: any) => {
@@ -601,12 +622,13 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [fullScreenGalleryFile, navigateGallery]);
 
-  const handleBulkZip = async () => {
-    if (selectedFileIds.size === 0) return;
+  const handleBulkZip = async (specificIds?: Set<string>) => {
+    const idsToProcess = specificIds || selectedFileIds;
+    if (idsToProcess.size === 0) return;
     showToast('Preparing ZIP archive... this may take a while.', 'success');
     try {
       const zip = new JSZip();
-      for (const id of selectedFileIds) {
+      for (const id of idsToProcess) {
         const file = files.find(f => f.id === id);
         if (!file || file.type === 'folder') continue;
         
@@ -629,7 +651,7 @@ export default function App() {
       const content = await zip.generateAsync({ type: 'blob' });
       saveAs(content, 'archive.zip');
       showToast('ZIP downloaded successfully');
-      setSelectedFileIds(new Set());
+      if (!specificIds) setSelectedFileIds(new Set());
     } catch (err: any) {
       showToast('Failed to create ZIP: ' + err.message, 'error');
     }
@@ -1243,6 +1265,7 @@ export default function App() {
           {selectedFileIds.size > 0 && (() => {
             const selectedFilesList = files.filter(f => selectedFileIds.has(f.id));
             const isSingleFile = selectedFilesList.length === 1 && selectedFilesList[0].type !== 'folder';
+            const isSingleZip = isSingleFile && selectedFilesList[0].name.toLowerCase().endsWith('.zip');
             
             return (
               <motion.div initial={{ y: 100, opacity: 0, x: '-50%' }} animate={{ y: 0, opacity: 1, x: '-50%' }} exit={{ y: 100, opacity: 0, x: '-50%' }} transition={{ type: 'spring', damping: 25, stiffness: 300 }}
@@ -1252,11 +1275,17 @@ export default function App() {
                   <span className="text-sm font-bold uppercase tracking-widest text-slate-300 hidden sm:inline-block">Selected</span>
                 </div>
                 <div className="flex items-center gap-1 sm:gap-2 shrink-0">
-                  <button onClick={handleBulkZipToCloud} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Zip to Cloud"><FileArchive size={18} /></button>
+                  {!isSingleZip && (
+                    <button onClick={() => handleBulkZipToCloud()} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Make Zip"><FileArchive size={18} /></button>
+                  )}
                   
-                  <button onClick={!isSingleFile ? handleBulkZip : () => handleDownload(selectedFilesList[0].id)} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title={!isSingleFile ? "Download as Zip" : "Download"}>
-                    {!isSingleFile ? <Archive size={18} /> : <Download size={18} />}
-                  </button>
+                  {isSingleZip ? (
+                    <button onClick={() => handleUnzip(selectedFilesList[0])} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Unzip"><FileArchive size={18} /></button>
+                  ) : (
+                    <button onClick={!isSingleFile ? handleBulkZip : () => handleDownload(selectedFilesList[0].id)} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title={!isSingleFile ? "Download as Zip" : "Download"}>
+                      {!isSingleFile ? <Archive size={18} /> : <Download size={18} />}
+                    </button>
+                  )}
                   
                   <button onClick={handleOpenMoveModal} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Move"><Folder size={18} /></button>
                   <button onClick={handleBulkDelete} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-red-400 transition-all border border-transparent hover:border-slate-700 shrink-0" title="Delete"><Trash2 size={18} /></button>
@@ -1597,23 +1626,47 @@ export default function App() {
 
         {/* Context Menu */}
         <AnimatePresence>
-          {contextMenu && (
-            <>
-              <div className="fixed inset-0 z-[90]" onClick={() => setContextMenu(null)} />
-              <motion.div initial={{ opacity: 0, scale: 0.95, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: -4 }} style={{ top: Math.min(contextMenu.y + 4, window.innerHeight - 260), left: Math.min(contextMenu.x, window.innerWidth - 200) }} className="fixed z-[100] bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl overflow-hidden w-48">
-                <div className="p-3 border-b border-slate-100 dark:border-slate-700"><p className="text-xs font-black text-slate-500 dark:text-slate-400 truncate">{contextMenu.file.name}</p></div>
-                <div className="p-2 space-y-0.5">
-                  {contextMenu.file.type !== 'folder' && <button onClick={() => { setPreviewFile(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 transition-all"><Eye size={16} /> Preview</button>}
-                  {contextMenu.file.type !== 'folder' && <button onClick={() => { setSelectedFile(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Info size={16} /> Details</button>}
-                  <button onClick={() => { handleRename(contextMenu.file.id, contextMenu.file.name); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Edit3 size={16} /> Rename</button>
-                  {contextMenu.file.type !== 'folder' && <button onClick={() => { handleDownload(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Download size={16} /> Download</button>}
-                  {contextMenu.file.type !== 'folder' && <button onClick={() => { handleShare(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Share2 size={16} /> Share</button>}
-                  <button onClick={() => { setSelectedFileIds(new Set([contextMenu.file.id])); setContextMenu(null); handleOpenMoveModal(); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Folder size={16} /> Move</button>
-                  <button onClick={() => { handleDeleteFile(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all"><Trash2 size={16} /> Delete</button>
-                </div>
-              </motion.div>
-            </>
-          )}
+          {contextMenu && (() => {
+            const menuWidth = 200;
+            const menuHeight = contextMenu.file.type === 'folder' ? 220 : 380;
+            let top = contextMenu.y + 4;
+            let left = contextMenu.x;
+            
+            if (left + menuWidth > window.innerWidth) left = window.innerWidth - menuWidth - 8;
+            if (top + menuHeight > window.innerHeight) top = Math.max(8, contextMenu.y - menuHeight - 4);
+            
+            const isZip = contextMenu.file.name.toLowerCase().endsWith('.zip');
+            
+            return (
+              <>
+                <div className="fixed inset-0 z-[90]" onClick={() => setContextMenu(null)} />
+                <motion.div initial={{ opacity: 0, scale: 0.95, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: -4 }} style={{ top, left }} className="fixed z-[100] bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl overflow-y-auto max-h-[80vh] w-48 no-scrollbar">
+                  <div className="p-3 border-b border-slate-100 dark:border-slate-700"><p className="text-xs font-black text-slate-500 dark:text-slate-400 truncate">{contextMenu.file.name}</p></div>
+                  <div className="p-2 space-y-0.5">
+                    {contextMenu.file.type !== 'folder' && <button onClick={() => { setPreviewFile(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 transition-all"><Eye size={16} /> Preview</button>}
+                    {contextMenu.file.type !== 'folder' && <button onClick={() => { setSelectedFile(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Info size={16} /> Details</button>}
+                    <button onClick={() => { handleRename(contextMenu.file.id, contextMenu.file.name); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Edit3 size={16} /> Rename</button>
+                    {contextMenu.file.type !== 'folder' && <button onClick={() => { handleDownload(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Download size={16} /> Download</button>}
+                    {contextMenu.file.type !== 'folder' && <button onClick={() => { handleShare(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Share2 size={16} /> Share</button>}
+                    <button onClick={() => { setSelectedFileIds(new Set([contextMenu.file.id])); setContextMenu(null); handleOpenMoveModal(); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Folder size={16} /> Move</button>
+                    
+                    {isZip ? (
+                      <button onClick={() => { handleUnzip(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><FileArchive size={16} /> Unzip</button>
+                    ) : (
+                      <>
+                        <button onClick={() => { setContextMenu(null); handleBulkZipToCloud(new Set([contextMenu.file.id])); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><FileArchive size={16} /> Make Zip</button>
+                        {contextMenu.file.type === 'folder' && (
+                          <button onClick={() => { setContextMenu(null); handleBulkZip(new Set([contextMenu.file.id])); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Archive size={16} /> Download as Zip</button>
+                        )}
+                      </>
+                    )}
+
+                    <button onClick={() => { handleDeleteFile(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all"><Trash2 size={16} /> Delete</button>
+                  </div>
+                </motion.div>
+              </>
+            );
+          })()}
         </AnimatePresence>
 
         {/* Preview Modal */}
@@ -1745,7 +1798,7 @@ export default function App() {
         {/* Full Screen Gallery Modal */}
         <AnimatePresence>
           {fullScreenGalleryFile && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-xl" onClick={() => setFullScreenGalleryFile(null)}>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-xl" onClick={() => setFullScreenGalleryFile(null)} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}>
               
               <div className="absolute top-4 right-4 z-50">
                 <button onClick={(e) => { e.stopPropagation(); setFullScreenGalleryFile(null); }} className="p-3 bg-white/10 hover:bg-white/20 text-white rounded-full backdrop-blur-md transition-all">
@@ -1765,7 +1818,7 @@ export default function App() {
 
               <div className="relative w-full h-full flex flex-col items-center justify-center" onClick={e => e.stopPropagation()}>
                 {fullScreenGalleryFile.type === 'image' && (
-                  <img src={getMediaUrl(fullScreenGalleryFile)} className="w-full h-full object-contain" alt={fullScreenGalleryFile.name} />
+                  <img src={getMediaUrl(fullScreenGalleryFile)} className="w-full h-full object-contain pointer-events-none" alt={fullScreenGalleryFile.name} />
                 )}
                 {fullScreenGalleryFile.type === 'video' && (
                   <video src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="w-full h-full" />
@@ -1780,11 +1833,6 @@ export default function App() {
                   <ChevronRight size={32} />
                 </button>
               )}
-              
-              {/* Mobile Swipe Areas */}
-              <div className="absolute inset-y-0 left-0 w-1/3 z-40 sm:hidden" onClick={(e) => navigateGallery('prev', e)} />
-              <div className="absolute inset-y-0 right-0 w-1/3 z-40 sm:hidden" onClick={(e) => navigateGallery('next', e)} />
-
             </motion.div>
           )}
         </AnimatePresence>
