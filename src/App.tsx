@@ -568,24 +568,26 @@ export default function App() {
     setPreviewFile({ ...file, url });
   };
 
-  const [touchStart, setTouchStart] = useState<number | null>(null);
-  const [touchEnd, setTouchEnd] = useState<number | null>(null);
+  const touchStartX = useRef<number | null>(null);
+  const touchEndX = useRef<number | null>(null);
 
   const handleTouchStart = (e: React.TouchEvent) => {
-    setTouchEnd(null);
-    setTouchStart(e.targetTouches[0].clientX);
+    touchEndX.current = null;
+    touchStartX.current = e.targetTouches[0].clientX;
   };
 
   const handleTouchMove = (e: React.TouchEvent) => {
-    setTouchEnd(e.targetTouches[0].clientX);
+    touchEndX.current = e.targetTouches[0].clientX;
   };
 
   const handleTouchEnd = () => {
-    if (!touchStart || !touchEnd) return;
-    const distance = touchStart - touchEnd;
+    if (!touchStartX.current || !touchEndX.current) return;
+    const distance = touchStartX.current - touchEndX.current;
     const minSwipeDistance = 50;
     if (distance > minSwipeDistance && hasNextMedia) navigateGallery('next');
     if (distance < -minSwipeDistance && hasPrevMedia) navigateGallery('prev');
+    touchStartX.current = null;
+    touchEndX.current = null;
   };
 
   const openFullScreenGallery = (file: any) => {
