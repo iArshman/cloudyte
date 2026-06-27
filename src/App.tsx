@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
-  Plus, Search, Trash2, Edit3, Download, Folder, File, ChevronRight, 
+  Plus, Search, Trash2, Edit3, Download, Folder, File as FileIconLucide, ChevronRight, ChevronLeft, 
   LogOut, Cloud, HardDrive, Menu, X, RefreshCw, Check, LayoutGrid, 
   List as ListIcon, Info, Moon, Sun, Eye, Settings, MoreVertical, 
-  Share2, Video, Send, ArrowLeft, ExternalLink, Archive, FileArchive
+  Share2, Video, Send, ArrowLeft, ExternalLink, Archive, FileArchive, Maximize
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import JSZip from 'jszip';
@@ -60,6 +60,13 @@ export default function App() {
   const [promptValue, setPromptValue]     = useState('');
   const [contextMenu, setContextMenu]     = useState<{ file: any; x: number; y: number } | null>(null);
   const [previewFile, setPreviewFile]     = useState<any | null>(null);
+  const [fullScreenGalleryFile, setFullScreenGalleryFile] = useState<any | null>(null);
+  const [isMoveModalOpen, setIsMoveModalOpen] = useState(false);
+  const [moveTargetAccountId, setMoveTargetAccountId] = useState<string | null>(null);
+  const [moveTargetFolderId, setMoveTargetFolderId] = useState<string>('root');
+  const [moveFoldersList, setMoveFoldersList] = useState<any[]>([]);
+  const [moveModalTab, setMoveModalTab] = useState<'current' | 'all'>('current');
+  const [moveLoading, setMoveLoading] = useState(false);
   const [toast, setToast]                 = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isLoggingIn, setIsLoggingIn]     = useState(false);
   const [isRegisterMode, setIsRegisterMode] = useState(false);
@@ -87,6 +94,12 @@ export default function App() {
 
   const handleSingleClick = (file: any, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (window.innerWidth < 768) {
+      if (file.type === 'folder') navigateToFolder(file);
+      else if (['image', 'video', 'audio', 'pdf'].includes(file.type)) openPreview(file);
+      else setSelectedFile(file);
+      return;
+    }
     if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
     clickTimeoutRef.current = setTimeout(() => {
       setSelectedFile(file);
@@ -441,6 +454,69 @@ export default function App() {
     });
   };
 
+  const fetchMoveFolders = useCallback(async (accountId: string, folderId: string) => {
+    setMoveLoading(true);
+    try {
+      const res = await fetch(`/api/files?accountId=${accountId}&folderId=${folderId}`, { headers: getAuthHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setMoveFoldersList(Array.isArray(data) ? data.filter(f => f.type === 'folder') : []);
+      }
+    } catch {}
+    setMoveLoading(false);
+  }, [getAuthHeaders]);
+
+  const handleOpenMoveModal = () => {
+    setMoveTargetAccountId(selectedAccountId);
+    setMoveTargetFolderId('root');
+    setMoveModalTab('current');
+    if (selectedAccountId) fetchMoveFolders(selectedAccountId, 'root');
+    setIsMoveModalOpen(true);
+  };
+
+  const navigateMoveFolder = (folderId: string) => {
+    setMoveTargetFolderId(folderId);
+    if (moveTargetAccountId) fetchMoveFolders(moveTargetAccountId, folderId);
+  };
+
+  const navigateMoveAccount = (accountId: string) => {
+    setMoveTargetAccountId(accountId);
+    setMoveTargetFolderId('root');
+    setMoveModalTab('current'); 
+    fetchMoveFolders(accountId, 'root');
+  };
+
+  const handleMoveConfirm = async () => {
+    if (selectedFileIds.size === 0 || !moveTargetAccountId) return;
+    showToast('Moving files...');
+    setIsMoveModalOpen(false);
+    let successCount = 0;
+    
+    for (const fileId of selectedFileIds) {
+      try {
+        const res = await fetch('/api/files/move', {
+          method: 'POST',
+          headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            sourceAccountId: selectedAccountId,
+            fileId, 
+            targetAccountId: moveTargetAccountId, 
+            targetFolderId: moveTargetFolderId 
+          }),
+        });
+        if (res.ok) successCount++;
+      } catch {}
+    }
+    
+    if (successCount > 0) {
+      showToast(`Moved ${successCount} file(s)`);
+      fetchFiles(selectedAccountId!, currentFolderId, debouncedSearch);
+      setSelectedFileIds(new Set());
+    } else {
+      showToast('Move failed for all files', 'error');
+    }
+  };
+
   const handleBulkDownload = async () => {
     if (selectedFileIds.size === 0) return;
     showToast('Starting downloads...');
@@ -490,6 +566,40 @@ export default function App() {
     const url = `/api/download/${selectedAccountId}/${file.id}?preview=1&token=${token}`;
     setPreviewFile({ ...file, url });
   };
+
+  const openFullScreenGallery = (file: any) => {
+    setPreviewFile(null); // Close the smaller modal
+    setFullScreenGalleryFile(file);
+  };
+
+  const getMediaUrl = useCallback((file: any) => {
+    if (!file) return '';
+    if (file.url) return file.url;
+    const token = localStorage.getItem('cloudyte_token');
+    return `/api/download/${selectedAccountId}/${file.id}?preview=1&token=${token}`;
+  }, [selectedAccountId]);
+
+  const mediaFiles = files.filter(f => ['image', 'video', 'audio'].includes(f.type));
+  const currentGalleryIndex = fullScreenGalleryFile ? mediaFiles.findIndex(f => f.id === fullScreenGalleryFile.id) : -1;
+  const hasNextMedia = currentGalleryIndex >= 0 && currentGalleryIndex < mediaFiles.length - 1;
+  const hasPrevMedia = currentGalleryIndex > 0;
+
+  const navigateGallery = useCallback((direction: 'next' | 'prev', e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (direction === 'next' && currentGalleryIndex >= 0 && currentGalleryIndex < mediaFiles.length - 1) setFullScreenGalleryFile(mediaFiles[currentGalleryIndex + 1]);
+    if (direction === 'prev' && currentGalleryIndex > 0) setFullScreenGalleryFile(mediaFiles[currentGalleryIndex - 1]);
+  }, [currentGalleryIndex, mediaFiles]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!fullScreenGalleryFile) return;
+      if (e.key === 'ArrowRight') navigateGallery('next');
+      if (e.key === 'ArrowLeft') navigateGallery('prev');
+      if (e.key === 'Escape') setFullScreenGalleryFile(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [fullScreenGalleryFile, navigateGallery]);
 
   const handleBulkZip = async () => {
     if (selectedFileIds.size === 0) return;
@@ -1130,24 +1240,36 @@ export default function App() {
         
         {/* Floating Action Bar */}
         <AnimatePresence>
-          {selectedFileIds.size > 0 && (
-            <motion.div initial={{ y: 100, opacity: 0, x: '-50%' }} animate={{ y: 0, opacity: 1, x: '-50%' }} exit={{ y: 100, opacity: 0, x: '-50%' }} transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-              className="fixed bottom-8 left-1/2 bg-slate-900 dark:bg-slate-800 text-white px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-6 z-50 border border-slate-800 dark:border-slate-700">
-              <div className="flex items-center gap-3 pr-6 border-r border-slate-700 dark:border-slate-600">
-                <div className="w-6 h-6 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-black shadow-inner shadow-blue-900/50">{selectedFileIds.size}</div>
-                <span className="text-sm font-bold uppercase tracking-widest text-slate-300">Selected</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <button onClick={handleBulkZipToCloud} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700" title="Zip to Cloud"><FileArchive size={18} /></button>
-                <button onClick={handleBulkZip} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700" title="Download as Zip"><Archive size={18} /></button>
-                <button onClick={handleBulkDownload} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700" title="Download"><Download size={18} /></button>
-                <button onClick={() => showToast('Bulk move coming soon')} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700" title="Move"><Folder size={18} /></button>
-                <button onClick={handleBulkDelete} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-red-400 transition-all border border-transparent hover:border-slate-700" title="Delete"><Trash2 size={18} /></button>
-                <div className="w-px h-6 bg-slate-700 dark:bg-slate-600 mx-2" />
-                <button onClick={() => setSelectedFileIds(new Set())} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700" title="Clear Selection"><X size={18} /></button>
-              </div>
-            </motion.div>
-          )}
+          {selectedFileIds.size > 0 && (() => {
+            const selectedFilesList = files.filter(f => selectedFileIds.has(f.id));
+            const isSingleFile = selectedFilesList.length === 1 && selectedFilesList[0].type !== 'folder';
+            
+            return (
+              <motion.div initial={{ y: 100, opacity: 0, x: '-50%' }} animate={{ y: 0, opacity: 1, x: '-50%' }} exit={{ y: 100, opacity: 0, x: '-50%' }} transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+                className="fixed bottom-4 sm:bottom-8 left-1/2 bg-slate-900 dark:bg-slate-800 text-white px-4 sm:px-6 py-3 sm:py-4 rounded-2xl shadow-2xl flex items-center gap-4 sm:gap-6 z-50 border border-slate-800 dark:border-slate-700 w-[95vw] sm:w-auto max-w-2xl overflow-x-auto no-scrollbar">
+                <div className="flex items-center gap-3 pr-4 sm:pr-6 border-r border-slate-700 dark:border-slate-600 shrink-0">
+                  <div className="w-6 h-6 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-black shadow-inner shadow-blue-900/50">{selectedFileIds.size}</div>
+                  <span className="text-sm font-bold uppercase tracking-widest text-slate-300 hidden sm:inline-block">Selected</span>
+                </div>
+                <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+                  <button onClick={handleBulkZipToCloud} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Zip to Cloud"><FileArchive size={18} /></button>
+                  
+                  {!isSingleFile && (
+                    <button onClick={handleBulkZip} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Download as Zip"><Archive size={18} /></button>
+                  )}
+                  
+                  {isSingleFile && (
+                    <button onClick={() => handleDownload(selectedFilesList[0].id)} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Download"><Download size={18} /></button>
+                  )}
+                  
+                  <button onClick={handleOpenMoveModal} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Move"><Folder size={18} /></button>
+                  <button onClick={handleBulkDelete} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-red-400 transition-all border border-transparent hover:border-slate-700 shrink-0" title="Delete"><Trash2 size={18} /></button>
+                  <div className="w-px h-6 bg-slate-700 dark:bg-slate-600 mx-1 sm:mx-2 shrink-0" />
+                  <button onClick={() => setSelectedFileIds(new Set())} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Clear Selection"><X size={18} /></button>
+                </div>
+              </motion.div>
+            );
+          })()}
         </AnimatePresence>
       </div>
 
@@ -1490,6 +1612,7 @@ export default function App() {
                   <button onClick={() => { handleRename(contextMenu.file.id, contextMenu.file.name); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Edit3 size={16} /> Rename</button>
                   {contextMenu.file.type !== 'folder' && <button onClick={() => { handleDownload(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Download size={16} /> Download</button>}
                   {contextMenu.file.type !== 'folder' && <button onClick={() => { handleShare(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Share2 size={16} /> Share</button>}
+                  <button onClick={() => { setSelectedFileIds(new Set([contextMenu.file.id])); setContextMenu(null); handleOpenMoveModal(); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Folder size={16} /> Move</button>
                   <button onClick={() => { handleDeleteFile(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all"><Trash2 size={16} /> Delete</button>
                 </div>
               </motion.div>
@@ -1502,7 +1625,7 @@ export default function App() {
           {previewFile && (
             <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setPreviewFile(null)} className="absolute inset-0 bg-black/80 backdrop-blur-sm" />
-              <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="relative z-10 bg-white dark:bg-slate-900 rounded-[2rem] shadow-2xl w-full max-w-6xl h-[90vh] flex flex-col overflow-hidden">
+              <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="relative z-10 bg-white dark:bg-slate-900 rounded-[2rem] shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden">
                 <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 dark:border-slate-800 shrink-0">
                   <div className="flex items-center gap-3 overflow-hidden">
                     <FileIcon file={previewFile} type={previewFile.type} isTg={previewFile.isTgDrive} accountId={selectedAccountId} />
@@ -1512,22 +1635,23 @@ export default function App() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
+                    {['image', 'video', 'audio'].includes(previewFile.type) && <button onClick={() => openFullScreenGallery(previewFile)} className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-all" title="Full Screen Gallery"><Maximize size={18} /></button>}
                     {previewFile.type !== 'folder' && <button onClick={() => handleDownload(previewFile.id)} className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-all" title="Download"><Download size={18} /></button>}
                     {previewFile.type !== 'folder' && <button onClick={() => handleShare(previewFile.id)} className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-all" title="Share"><Share2 size={18} /></button>}
                     <button onClick={() => setPreviewFile(null)} className="p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all"><X size={18} /></button>
                   </div>
                 </div>
-                <div className="flex-1 overflow-hidden flex items-center justify-center bg-slate-50 dark:bg-slate-950">
+                <div className="flex-1 overflow-auto flex items-center justify-center p-6 bg-slate-50 dark:bg-slate-950 min-h-[300px]">
                   {previewFile.type === 'image' ? (
-                    <img src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} alt={previewFile.name} className="w-full h-full object-contain" />
+                    <img src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} alt={previewFile.name} className="max-w-full max-h-[60vh] rounded-xl shadow-lg object-contain cursor-pointer transition-transform hover:scale-[1.02]" onClick={() => openFullScreenGallery(previewFile)} />
                   ) : previewFile.type === 'video' ? (
-                    <video controls autoPlay className="w-full h-full outline-none" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
-                  ) : previewFile.type === 'audio' ? (
-                    <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-900 dark:to-slate-950">
-                      <audio controls autoPlay className="w-full max-w-md shadow-2xl rounded-full" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
+                    <div className="relative group cursor-pointer max-w-full max-h-[60vh]">
+                      <video controls autoPlay className="max-w-full max-h-[60vh] rounded-xl shadow-lg" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
                     </div>
+                  ) : previewFile.type === 'audio' ? (
+                    <audio controls autoPlay className="w-full max-w-md" src={previewFile.url || `/api/download/${selectedAccountId}/${previewFile.id}?preview=1`} />
                   ) : previewFile.type === 'pdf' && (previewFile.url || (previewFile.webViewLink && !previewFile.isTgDrive)) ? (
-                    <iframe src={previewFile.url || previewFile.webViewLink} className="w-full h-full border-0" title={previewFile.name} />
+                    <iframe src={previewFile.url || previewFile.webViewLink} className="w-full h-[60vh] rounded-xl border border-slate-200 dark:border-slate-700" title={previewFile.name} />
                   ) : (
                     <div className="text-center space-y-6">
                       <div className="w-20 h-20 mx-auto"><FileIcon file={previewFile} type={previewFile.type} size="lg" isTg={previewFile.isTgDrive} accountId={selectedAccountId} /></div>
@@ -1550,6 +1674,127 @@ export default function App() {
                 </div>
               </motion.div>
             </div>
+          )}
+        </AnimatePresence>
+
+        {/* Move Modal */}
+        <AnimatePresence>
+          {isMoveModalOpen && (
+            <div className="fixed inset-0 z-[250] flex items-center justify-center p-4">
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setIsMoveModalOpen(false)} className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+              <motion.div initial={{ scale: 0.95, opacity: 0, y: 20 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.95, opacity: 0, y: 20 }} className="relative z-10 bg-white dark:bg-slate-900 rounded-[2rem] shadow-2xl w-full max-w-lg overflow-hidden border border-slate-200 dark:border-slate-800 flex flex-col h-[70vh]">
+                <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between shrink-0">
+                  <h3 className="font-black text-slate-900 dark:text-white text-lg">Move {selectedFileIds.size} file(s)</h3>
+                  <button onClick={() => setIsMoveModalOpen(false)} className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all"><X size={18} /></button>
+                </div>
+                
+                <div className="flex px-6 border-b border-slate-100 dark:border-slate-800 shrink-0">
+                  <button onClick={() => { setMoveModalTab('current'); if(selectedAccountId) navigateMoveAccount(selectedAccountId); }} className={`py-3 px-4 font-bold text-sm border-b-2 transition-all ${moveModalTab === 'current' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>Current location</button>
+                  <button onClick={() => setMoveModalTab('all')} className={`py-3 px-4 font-bold text-sm border-b-2 transition-all ${moveModalTab === 'all' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>All locations</button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 bg-slate-50 dark:bg-slate-950/50">
+                  {moveLoading ? (
+                    <div className="flex items-center justify-center h-full"><RefreshCw className="animate-spin text-slate-400" size={24} /></div>
+                  ) : moveModalTab === 'all' ? (
+                    <div className="space-y-2">
+                      {accounts.map(acc => (
+                        <div key={acc.id} onClick={() => navigateMoveAccount(acc.id)} className="flex items-center gap-3 p-3 rounded-xl hover:bg-white dark:hover:bg-slate-800 cursor-pointer border border-transparent hover:border-slate-200 dark:hover:border-slate-700 transition-all">
+                          <div className="w-10 h-10 rounded-full bg-blue-50 dark:bg-blue-900/20 text-blue-600 flex items-center justify-center shrink-0">
+                            {acc.accountType === 'google' ? <HardDrive size={18} /> : acc.accountType === 'onedrive' ? <Cloud size={18} /> : <Share2 size={18} />}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="font-bold text-slate-700 dark:text-slate-300 truncate">{acc.accountType === 'tgdrive' ? `TG Drive: ${acc.channelId}` : acc.email}</p>
+                            <p className="text-xs text-slate-400 font-medium uppercase tracking-widest">{acc.accountType}</p>
+                          </div>
+                          <ChevronRight size={18} className="text-slate-400" />
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {moveTargetFolderId !== 'root' && (
+                        <div onClick={() => navigateMoveFolder('root')} className="flex items-center gap-3 p-3 rounded-xl hover:bg-white dark:hover:bg-slate-800 cursor-pointer border border-transparent hover:border-slate-200 dark:hover:border-slate-700 transition-all text-slate-600 dark:text-slate-400 font-bold">
+                          <ArrowLeft size={18} /> Back to Root
+                        </div>
+                      )}
+                      {moveFoldersList.length === 0 ? (
+                        <div className="text-center p-8 text-slate-500 font-medium">No folders here.</div>
+                      ) : (
+                        moveFoldersList.map(f => (
+                          <div key={f.id} onClick={() => navigateMoveFolder(f.id)} className="flex items-center gap-3 p-3 rounded-xl hover:bg-white dark:hover:bg-slate-800 cursor-pointer border border-transparent hover:border-slate-200 dark:hover:border-slate-700 transition-all">
+                            <div className="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-900/20 text-amber-500 flex items-center justify-center shrink-0">
+                              <Folder size={18} fill="currentColor" />
+                            </div>
+                            <p className="font-bold text-slate-700 dark:text-slate-300 truncate flex-1">{f.name}</p>
+                            <ChevronRight size={18} className="text-slate-400" />
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="px-6 py-4 bg-white dark:bg-slate-900 border-t border-slate-100 dark:border-slate-800 shrink-0 flex items-center justify-between">
+                  <button onClick={() => setIsMoveModalOpen(false)} className="px-5 py-2.5 rounded-xl font-bold text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition-all">Cancel</button>
+                  <button onClick={handleMoveConfirm} disabled={moveLoading || (moveModalTab === 'all' && moveTargetAccountId === selectedAccountId)} className="px-6 py-2.5 rounded-xl font-bold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-blue-900/20">
+                    Move Here
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Full Screen Gallery Modal */}
+        <AnimatePresence>
+          {fullScreenGalleryFile && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-xl" onClick={() => setFullScreenGalleryFile(null)}>
+              
+              <div className="absolute top-4 right-4 z-50">
+                <button onClick={(e) => { e.stopPropagation(); setFullScreenGalleryFile(null); }} className="p-3 bg-white/10 hover:bg-white/20 text-white rounded-full backdrop-blur-md transition-all">
+                  <X size={24} />
+                </button>
+              </div>
+
+              <div className="absolute top-4 left-4 z-50 text-white/50 text-sm font-bold tracking-widest uppercase bg-black/40 px-4 py-2 rounded-xl backdrop-blur-md">
+                {currentGalleryIndex + 1} / {mediaFiles.length}
+              </div>
+
+              {hasPrevMedia && (
+                <button onClick={(e) => navigateGallery('prev', e)} className="absolute left-4 z-50 p-4 bg-white/5 hover:bg-white/10 text-white rounded-full backdrop-blur-md transition-all hidden sm:block">
+                  <ChevronLeft size={32} />
+                </button>
+              )}
+
+              <div className="relative w-full h-full max-w-7xl flex flex-col items-center justify-center p-4 sm:p-12" onClick={e => e.stopPropagation()}>
+                {fullScreenGalleryFile.type === 'image' && (
+                  <img src={getMediaUrl(fullScreenGalleryFile)} className="max-w-full max-h-[85vh] object-contain shadow-2xl" alt={fullScreenGalleryFile.name} />
+                )}
+                {fullScreenGalleryFile.type === 'video' && (
+                  <video src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="max-w-full max-h-[85vh] shadow-2xl" />
+                )}
+                {fullScreenGalleryFile.type === 'audio' && (
+                  <audio src={getMediaUrl(fullScreenGalleryFile)} controls autoPlay className="w-full max-w-xl shadow-2xl" />
+                )}
+                <div className="absolute bottom-8 inset-x-0 flex justify-center">
+                  <div className="bg-black/50 backdrop-blur-md px-6 py-3 rounded-2xl">
+                    <p className="text-white text-center font-bold text-sm sm:text-base tracking-wide">{fullScreenGalleryFile.name}</p>
+                  </div>
+                </div>
+              </div>
+
+              {hasNextMedia && (
+                <button onClick={(e) => navigateGallery('next', e)} className="absolute right-4 z-50 p-4 bg-white/5 hover:bg-white/10 text-white rounded-full backdrop-blur-md transition-all hidden sm:block">
+                  <ChevronRight size={32} />
+                </button>
+              )}
+              
+              {/* Mobile Swipe Areas */}
+              <div className="absolute inset-y-0 left-0 w-1/3 z-40 sm:hidden" onClick={(e) => navigateGallery('prev', e)} />
+              <div className="absolute inset-y-0 right-0 w-1/3 z-40 sm:hidden" onClick={(e) => navigateGallery('next', e)} />
+
+            </motion.div>
           )}
         </AnimatePresence>
 
@@ -1775,13 +2020,13 @@ function FileIcon({ file, type, size = 'sm', isTg = false, accountId, showThumbn
 
   if (type === 'folder') return <div className={`${base} bg-amber-50 dark:bg-amber-900/20 text-amber-500 group-hover:scale-110`}><Folder size={iconSize} fill="currentColor" /></div>;
   if (isTg)             return <div className={`${base} bg-sky-50 dark:bg-sky-900/20 text-sky-500 group-hover:scale-110`}><TelegramIcon size={iconSize} /></div>;
-  if (type === 'pdf')   return <div className={`${base} bg-rose-50 dark:bg-rose-900/20 text-rose-500`}><File size={iconSize} /></div>;
+  if (type === 'pdf')   return <div className={`${base} bg-rose-50 dark:bg-rose-900/20 text-rose-500`}><FileIconLucide size={iconSize} /></div>;
   if (type === 'image') return <div className={`${base} bg-blue-50 dark:bg-blue-900/20 text-blue-500 group-hover:scale-110`}><Eye size={iconSize} /></div>;
   if (type === 'audio') return <div className={`${base} bg-pink-50 dark:bg-pink-900/20 text-pink-500 group-hover:scale-110`}><RefreshCw size={iconSize} /></div>;
   if (type === 'video') return <div className={`${base} bg-purple-50 dark:bg-purple-900/20 text-purple-500 group-hover:scale-110`}><Video size={iconSize} /></div>;
   if (type === 'sheet') return <div className={`${base} bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600`}><HardDrive size={iconSize} /></div>;
-  if (type === 'doc')   return <div className={`${base} bg-blue-50 dark:bg-blue-900/20 text-blue-600`}><File size={iconSize} /></div>;
+  if (type === 'doc')   return <div className={`${base} bg-blue-50 dark:bg-blue-900/20 text-blue-600`}><FileIconLucide size={iconSize} /></div>;
   if (type === 'slide') return <div className={`${base} bg-orange-50 dark:bg-orange-900/20 text-orange-600`}><LayoutGrid size={iconSize} /></div>;
   if (type === 'zip')   return <div className={`${base} bg-slate-100 dark:bg-slate-800 text-slate-600`}><Settings size={iconSize} /></div>;
-  return <div className={`${base} bg-slate-50 dark:bg-slate-900 text-slate-400`}><File size={iconSize} /></div>;
+  return <div className={`${base} bg-slate-50 dark:bg-slate-900 text-slate-400`}><FileIconLucide size={iconSize} /></div>;
 }

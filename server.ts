@@ -1131,7 +1131,6 @@ app.post('/api/share', requireAuth, async (req: any, res: any) => {
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
   try {
-    // For TG Drive: reuse the shareId that's already embedded in the file record
     if (account.accountType === 'tgdrive') {
       const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
       if (!meta) return res.status(404).json({ error: 'File not found' });
@@ -1146,6 +1145,61 @@ app.post('/api/share', requireAuth, async (req: any, res: any) => {
     const shareId = nanoid(6);
     await database.collection('shares').insertOne({ shareId, accountId: new ObjectId(accountId), fileId, createdAt: new Date().toISOString() });
     res.json({ success: true, shareUrl: `${process.env.APP_URL}/s/${shareId}` });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Move ────────────────────────────────────────────────────────────────────
+app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
+  const { sourceAccountId, fileId, targetAccountId, targetFolderId } = req.body;
+  const userId = req.userId;
+  const database = req.db;
+
+  if (sourceAccountId !== targetAccountId) {
+    return res.status(400).json({ error: 'Cross-account moving is not supported yet' });
+  }
+
+  const query: any = { _id: new ObjectId(sourceAccountId) };
+  if (!req.isAdmin && userId) query.userId = String(userId);
+  const account = await database.collection('accounts').findOne(query);
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  try {
+    if (account.accountType === 'tgdrive') {
+      await database.collection('tg_files').updateOne(
+        { _id: new ObjectId(fileId), accountId: String(account._id) },
+        { $set: { folderId: targetFolderId } }
+      );
+      return res.json({ success: true });
+    } else if (account.accountType === 'google') {
+      const drive = await getDriveClient(account.credentials);
+      const file = await drive.files.get({ fileId, fields: 'parents' });
+      const previousParents = file.data.parents?.join(',') || '';
+      
+      const realTargetId = targetFolderId === 'root' ? 'root' : targetFolderId;
+      
+      await drive.files.update({
+        fileId,
+        addParents: realTargetId,
+        removeParents: previousParents,
+        fields: 'id, parents'
+      });
+      return res.json({ success: true });
+    } else if (account.accountType === 'onedrive') {
+      const token = account.credentials.access_token;
+      const realTargetId = targetFolderId === 'root' ? 'root' : targetFolderId;
+      const url = `https://graph.microsoft.com/v1.0/me/drive/items/${fileId}`;
+      await axios.patch(url, {
+        parentReference: {
+          id: realTargetId === 'root' ? (await axios.get('https://graph.microsoft.com/v1.0/me/drive/root', { headers: { Authorization: `Bearer ${token}` } })).data.id : realTargetId
+        }
+      }, {
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+      });
+      return res.json({ success: true });
+    }
+    res.status(400).json({ error: 'Unsupported account type' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
