@@ -3,7 +3,7 @@ import {
   Plus, Search, Trash2, Edit3, Download, Folder, File as FileIconLucide, ChevronRight, ChevronLeft, 
   LogOut, Cloud, HardDrive, Menu, X, RefreshCw, Check, LayoutGrid, 
   List as ListIcon, Info, Moon, Sun, Eye, Settings, MoreVertical, 
-  Share2, Video, Send, ArrowLeft, ExternalLink, Archive, FileArchive, Maximize
+  Share2, Video, Send, ArrowLeft, ExternalLink, Archive, FileArchive, Maximize, Copy
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import JSZip from 'jszip';
@@ -62,6 +62,7 @@ export default function App() {
   const [previewFile, setPreviewFile]     = useState<any | null>(null);
   const [fullScreenGalleryFile, setFullScreenGalleryFile] = useState<any | null>(null);
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(false);
+  const [modalAction, setModalAction] = useState<'move' | 'copy'>('move');
   const [moveTargetAccountId, setMoveTargetAccountId] = useState<string | null>(null);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState<string>('root');
   const [moveFoldersList, setMoveFoldersList] = useState<any[]>([]);
@@ -466,7 +467,8 @@ export default function App() {
     setMoveLoading(false);
   }, [getAuthHeaders]);
 
-  const handleOpenMoveModal = () => {
+  const handleOpenMoveModal = (action: 'move' | 'copy' = 'move') => {
+    setModalAction(action);
     setMoveTargetAccountId(selectedAccountId);
     setMoveTargetFolderId('root');
     setMoveModalTab('current');
@@ -488,13 +490,13 @@ export default function App() {
 
   const handleMoveConfirm = async () => {
     if (selectedFileIds.size === 0 || !moveTargetAccountId) return;
-    showToast('Moving files...');
+    showToast(`${modalAction === 'move' ? 'Moving' : 'Copying'} files...`);
     setIsMoveModalOpen(false);
     let successCount = 0;
     
     for (const fileId of selectedFileIds) {
       try {
-        const res = await fetch('/api/files/move', {
+        const res = await fetch(`/api/files/${modalAction}`, {
           method: 'POST',
           headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({ 
@@ -509,11 +511,11 @@ export default function App() {
     }
     
     if (successCount > 0) {
-      showToast(`Moved ${successCount} file(s)`);
+      showToast(`${modalAction === 'move' ? 'Moved' : 'Copied'} ${successCount} file(s)`);
       fetchFiles(selectedAccountId!, currentFolderId, debouncedSearch);
       setSelectedFileIds(new Set());
     } else {
-      showToast('Move failed for all files', 'error');
+      showToast(`${modalAction === 'move' ? 'Move' : 'Copy'} failed for all files`, 'error');
     }
   };
 
@@ -1167,8 +1169,8 @@ export default function App() {
                   </label>
                 </div>
               ) : viewMode === 'list' ? (
-                <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden">
-                  <table className="w-full text-left">
+                <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-x-auto">
+                  <table className="w-full text-left min-w-[600px]">
                     <thead className="bg-slate-50/50 dark:bg-slate-900/50 border-b border-slate-100 dark:border-slate-800">
                       <tr>
                         <th className="px-6 py-5 w-1">
@@ -1206,7 +1208,7 @@ export default function App() {
                           </td>
                           <td className="px-6 py-5 text-xs font-bold text-slate-400 hidden md:table-cell">{file.createdAt}</td>
                           <td className="px-6 py-5 text-xs font-bold text-slate-400 hidden lg:table-cell">{file.modified}</td>
-                          <td className="px-6 py-5 text-right"><span className="text-[10px] font-bold font-mono text-slate-500 bg-slate-100 dark:bg-slate-950 px-2 py-1 rounded-lg uppercase">{file.size}</span></td>
+                          <td className="px-6 py-5 text-right whitespace-nowrap"><span className="text-[10px] font-bold font-mono text-slate-500 bg-slate-100 dark:bg-slate-950 px-2 py-1 rounded-lg uppercase">{file.size}</span></td>
                           <td className="px-6 py-4 text-right w-40 whitespace-nowrap">
                             <div className="flex items-center justify-end gap-1" onClick={e => e.stopPropagation()}>
                               <div className="hidden lg:flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all translate-x-2 group-hover:translate-x-0">
@@ -1289,7 +1291,8 @@ export default function App() {
                     </button>
                   )}
                   
-                  <button onClick={handleOpenMoveModal} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Move"><Folder size={18} /></button>
+                  <button onClick={() => handleOpenMoveModal('move')} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Move"><Folder size={18} /></button>
+                  <button onClick={() => handleOpenMoveModal('copy')} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Copy"><Copy size={18} /></button>
                   <button onClick={handleBulkDelete} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-red-400 transition-all border border-transparent hover:border-slate-700 shrink-0" title="Delete"><Trash2 size={18} /></button>
                   <div className="w-px h-6 bg-slate-700 dark:bg-slate-600 mx-1 sm:mx-2 shrink-0" />
                   <button onClick={() => setSelectedFileIds(new Set())} className="p-2 hover:bg-slate-800 dark:hover:bg-slate-700 rounded-xl text-slate-400 hover:text-white transition-all border border-transparent hover:border-slate-700 shrink-0" title="Clear Selection"><X size={18} /></button>
@@ -1650,7 +1653,8 @@ export default function App() {
                     <button onClick={() => { handleRename(contextMenu.file.id, contextMenu.file.name); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Edit3 size={16} /> Rename</button>
                     {contextMenu.file.type !== 'folder' && <button onClick={() => { handleDownload(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Download size={16} /> Download</button>}
                     {contextMenu.file.type !== 'folder' && <button onClick={() => { handleShare(contextMenu.file.id); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Share2 size={16} /> Share</button>}
-                    <button onClick={() => { setSelectedFileIds(new Set([contextMenu.file.id])); setContextMenu(null); handleOpenMoveModal(); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Folder size={16} /> Move</button>
+                    <button onClick={() => { setSelectedFileIds(new Set([contextMenu.file.id])); setContextMenu(null); handleOpenMoveModal('move'); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Folder size={16} /> Move</button>
+                    <button onClick={() => { setSelectedFileIds(new Set([contextMenu.file.id])); setContextMenu(null); handleOpenMoveModal('copy'); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><Copy size={16} /> Copy</button>
                     
                     {isZip ? (
                       <button onClick={() => { handleUnzip(contextMenu.file); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-all"><FileArchive size={16} /> Unzip</button>
@@ -1728,14 +1732,14 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* Move Modal */}
+        {/* Move/Copy Modal */}
         <AnimatePresence>
           {isMoveModalOpen && (
             <div className="fixed inset-0 z-[250] flex items-center justify-center p-4">
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setIsMoveModalOpen(false)} className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
               <motion.div initial={{ scale: 0.95, opacity: 0, y: 20 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.95, opacity: 0, y: 20 }} className="relative z-10 bg-white dark:bg-slate-900 rounded-[2rem] shadow-2xl w-full max-w-lg overflow-hidden border border-slate-200 dark:border-slate-800 flex flex-col h-[70vh]">
                 <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between shrink-0">
-                  <h3 className="font-black text-slate-900 dark:text-white text-lg">Move {selectedFileIds.size} file(s)</h3>
+                  <h3 className="font-black text-slate-900 dark:text-white text-lg capitalize">{modalAction} {selectedFileIds.size} file(s)</h3>
                   <button onClick={() => setIsMoveModalOpen(false)} className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all"><X size={18} /></button>
                 </div>
                 
@@ -1788,8 +1792,8 @@ export default function App() {
 
                 <div className="px-6 py-4 bg-white dark:bg-slate-900 border-t border-slate-100 dark:border-slate-800 shrink-0 flex items-center justify-between">
                   <button onClick={() => setIsMoveModalOpen(false)} className="px-5 py-2.5 rounded-xl font-bold text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition-all">Cancel</button>
-                  <button onClick={handleMoveConfirm} disabled={moveLoading || (moveModalTab === 'all' && moveTargetAccountId === selectedAccountId)} className="px-6 py-2.5 rounded-xl font-bold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-blue-900/20">
-                    Move Here
+                  <button onClick={handleMoveConfirm} disabled={moveLoading || (moveModalTab === 'all' && moveTargetAccountId === selectedAccountId)} className="px-6 py-2.5 rounded-xl font-bold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-blue-900/20 capitalize">
+                    {modalAction} Here
                   </button>
                 </div>
               </motion.div>

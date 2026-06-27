@@ -943,9 +943,15 @@ app.delete('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
     if (account.accountType === 'tgdrive') {
       const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
       if (!meta) return res.status(404).json({ error: 'File not found' });
-      const telegram = await getTgClient();
-      const peer     = await resolvePeer(telegram, account.channelId);
-      try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* message may already be gone */ }
+      
+      const referenceCount = await database.collection('tg_files').countDocuments({ messageId: meta.messageId, accountId: meta.accountId });
+      
+      if (referenceCount <= 1) {
+        const telegram = await getTgClient();
+        const peer     = await resolvePeer(telegram, account.channelId);
+        try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* message may already be gone */ }
+      }
+      
       await database.collection('tg_files').deleteOne({ _id: new ObjectId(fileId) });
     } else if (account.accountType === 'onedrive') {
       const c = await getOneDriveClient(account.tokens, account._id.toString());
@@ -1167,9 +1173,10 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
 
   try {
     if (account.accountType === 'tgdrive') {
+      const realTargetId = targetFolderId === 'root' ? '' : targetFolderId;
       await database.collection('tg_files').updateOne(
-        { _id: new ObjectId(fileId), accountId: String(account._id) },
-        { $set: { folderId: targetFolderId } }
+        { _id: new ObjectId(fileId) },
+        { $set: { folder: realTargetId } }
       );
       return res.json({ success: true });
     } else if (account.accountType === 'google') {
@@ -1193,6 +1200,75 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
       await axios.patch(url, {
         parentReference: {
           id: realTargetId === 'root' ? (await axios.get('https://graph.microsoft.com/v1.0/me/drive/root', { headers: { Authorization: `Bearer ${token}` } })).data.id : realTargetId
+        }
+      }, {
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+      });
+      return res.json({ success: true });
+    }
+    res.status(400).json({ error: 'Unsupported account type' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Copy file ────────────────────────────────────────────────────────────────
+app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
+  const { sourceAccountId, fileId, targetAccountId, targetFolderId } = req.body;
+  const userId = req.userId;
+  const database = req.db;
+
+  if (sourceAccountId !== targetAccountId) {
+    return res.status(400).json({ error: 'Cross-account copying is not supported yet' });
+  }
+
+  const query: any = { _id: new ObjectId(sourceAccountId) };
+  if (!req.isAdmin && userId) query.userId = String(userId);
+  const account = await database.collection('accounts').findOne(query);
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  try {
+    if (account.accountType === 'tgdrive') {
+      const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
+      if (!meta) return res.status(404).json({ error: 'File not found' });
+      
+      const realTargetId = targetFolderId === 'root' ? '' : targetFolderId;
+      
+      // Duplicate document in mongo
+      const newMeta = { ...meta };
+      delete newMeta._id;
+      newMeta.folder = realTargetId;
+      newMeta.date = new Date(); // Update date to now?
+      
+      // Append " - Copy" if in same folder
+      if (meta.folder === realTargetId) {
+        newMeta.name = newMeta.name.replace(/(\.[^.]+)$|$/, ' - Copy$1');
+      }
+
+      await database.collection('tg_files').insertOne(newMeta);
+      return res.json({ success: true });
+    } else if (account.accountType === 'google') {
+      const drive = await getDriveClient(account.tokens || account.credentials); // depending on how tokens are stored, wait, the codebase uses account.tokens for most. Let me check move api.
+      const realTargetId = targetFolderId === 'root' ? 'root' : targetFolderId;
+      
+      await drive.files.copy({
+        fileId,
+        requestBody: {
+          parents: [realTargetId]
+        }
+      });
+      return res.json({ success: true });
+    } else if (account.accountType === 'onedrive') {
+      const token = account.tokens?.access_token || account.credentials?.access_token;
+      let realTargetId = targetFolderId;
+      if (targetFolderId === 'root') {
+         const rootRes = await axios.get('https://graph.microsoft.com/v1.0/me/drive/root', { headers: { Authorization: `Bearer ${token}` } });
+         realTargetId = rootRes.data.id;
+      }
+      const url = `https://graph.microsoft.com/v1.0/me/drive/items/${fileId}/copy`;
+      await axios.post(url, {
+        parentReference: {
+          id: realTargetId
         }
       }, {
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
