@@ -1307,7 +1307,7 @@ export default function App() {
         <AnimatePresence>
           {selectedFile && (
             <>
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setSelectedFile(null)} className="fixed inset-0 bg-black/20 dark:bg-black/50 z-50 lg:hidden" />
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setSelectedFile(null)} className="fixed inset-0 bg-black/20 dark:bg-black/50 z-50 lg:bg-transparent" />
               <motion.div initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }} transition={{ type: 'spring', damping: 30, stiffness: 400 }} className="fixed top-0 right-0 h-full w-full max-w-sm bg-white dark:bg-slate-800 shadow-2xl z-[60] border-l border-slate-200 dark:border-slate-700 flex flex-col">
                 <div className="p-6 flex items-center justify-between border-b border-slate-100 dark:border-slate-700">
                   <h3 className="font-black text-slate-900 dark:text-white uppercase tracking-widest text-xs">File Details</h3>
