@@ -55,6 +55,9 @@ export default function App() {
   const [tgRegisterError, setTgRegisterError] = useState('');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ name: string; percent: number } | null>(null);
+  const [apiKeys, setApiKeys] = useState<any[]>([]);
+  const [newApiKeyValue, setNewApiKeyValue] = useState<string | null>(null);
+  const [generatingApiKey, setGeneratingApiKey] = useState(false);
   const [promptModal, setPromptModal]     = useState<{ isOpen: boolean; title: string; defaultValue: string; onConfirm: (val: string) => void; onCancel: () => void } | null>(null);
   const [confirmModal, setConfirmModal]   = useState<{ isOpen: boolean; title: string; message: string; onConfirm: () => void; onCancel: () => void } | null>(null);
   const [promptValue, setPromptValue]     = useState('');
@@ -207,6 +210,45 @@ export default function App() {
   }, [getAuthHeaders]);
 
   useEffect(() => { fetchAccounts(); }, [fetchAccounts]);
+  
+  const fetchApiKeys = useCallback(async () => {
+    try {
+      const res = await fetch('/api/user/api-keys', { headers: getAuthHeaders() });
+      if (res.ok) setApiKeys(await res.json());
+    } catch { /* ignore */ }
+  }, [getAuthHeaders]);
+
+  useEffect(() => { if (isSettingsOpen) fetchApiKeys(); }, [isSettingsOpen, fetchApiKeys]);
+
+  const generateApiKey = async (name: string) => {
+    setGeneratingApiKey(true);
+    try {
+      const res = await fetch('/api/user/api-keys', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setNewApiKeyValue(data.key);
+        fetchApiKeys();
+        showToast('API Key generated successfully');
+      }
+    } catch (e: any) { showToast('Error generating key', 'error'); }
+    setGeneratingApiKey(false);
+  };
+
+  const revokeApiKey = async (id: string) => {
+    if (!confirm('Are you sure you want to revoke this API key? Any applications using it will lose access immediately.')) return;
+    try {
+      const res = await fetch(`/api/user/api-keys/${id}`, { method: 'DELETE', headers: getAuthHeaders() });
+      if (res.ok) {
+        fetchApiKeys();
+        showToast('API Key revoked');
+      }
+    } catch (e: any) { showToast('Error revoking key', 'error'); }
+  };
+
   useEffect(() => { const t = setTimeout(() => setDebouncedSearch(searchQuery), 400); return () => clearTimeout(t); }, [searchQuery]);
   useEffect(() => { if (selectedAccountId) fetchFiles(selectedAccountId, currentFolderId, debouncedSearch); }, [selectedAccountId, currentFolderId, debouncedSearch, fetchFiles]);
 
@@ -1492,6 +1534,50 @@ export default function App() {
                       ))}
                       <button onClick={() => { setIsSettingsOpen(false); setLinkProviderModal(true); }} className="w-full flex items-center justify-center gap-2 py-3 border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-2xl text-sm font-bold text-slate-400 hover:text-blue-500 hover:border-blue-500 transition-all">
                         <Plus size={16} /><span>Link Another Account</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <h3 className="text-[10px] font-black uppercase text-slate-400 tracking-[0.2em]">Developer API Keys</h3>
+                    <div className="space-y-3">
+                      {newApiKeyValue && (
+                        <div className="p-4 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-2xl">
+                          <p className="text-sm font-bold text-green-700 dark:text-green-400 mb-2">New API Key Generated!</p>
+                          <p className="text-[10px] text-green-600 dark:text-green-500 mb-3">Copy this key now. You won't be able to see it again.</p>
+                          <div className="flex items-center gap-2 bg-white dark:bg-black/20 p-2 rounded-xl">
+                            <code className="text-xs font-mono flex-1 text-slate-800 dark:text-slate-200 break-all">{newApiKeyValue}</code>
+                            <button onClick={() => { navigator.clipboard.writeText(newApiKeyValue); showToast('Copied to clipboard'); }} className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-slate-500 transition-all">Copy</button>
+                          </div>
+                          <button onClick={() => setNewApiKeyValue(null)} className="mt-3 text-xs font-bold text-green-700 dark:text-green-400 hover:underline">I have saved it</button>
+                        </div>
+                      )}
+                      
+                      {apiKeys.map(key => (
+                        <div key={key.id} className="flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800/50 rounded-2xl group">
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-bold truncate dark:text-white">{key.name}</p>
+                            <div className="flex items-center gap-2 mt-1 pr-2">
+                              <code className="text-[10px] font-mono text-slate-500 truncate bg-slate-100 dark:bg-slate-800 px-2 py-1 rounded">{key.key}</code>
+                              <button onClick={() => { navigator.clipboard.writeText(key.key); showToast('Copied to clipboard'); }} className="text-slate-400 hover:text-purple-500 transition-colors" title="Copy Key"><Copy size={12} /></button>
+                            </div>
+                            <p className="text-[10px] text-slate-400 mt-1">Created: {new Date(key.createdAt).toLocaleDateString()}</p>
+                          </div>
+                          <button onClick={() => revokeApiKey(key.id)} className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-all opacity-0 group-hover:opacity-100" title="Revoke Key"><Trash2 size={16} /></button>
+                        </div>
+                      ))}
+                      
+                      <button onClick={() => {
+                        setPromptModal({
+                          isOpen: true,
+                          title: 'Name your API Key',
+                          defaultValue: 'My App Key',
+                          onConfirm: (val) => generateApiKey(val),
+                          onCancel: () => setPromptModal(null)
+                        });
+                      }} disabled={generatingApiKey} className="w-full flex items-center justify-center gap-2 py-3 border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-2xl text-sm font-bold text-slate-400 hover:text-purple-500 hover:border-purple-500 transition-all disabled:opacity-50">
+                        {generatingApiKey ? <RefreshCw size={16} className="animate-spin" /> : <Plus size={16} />}
+                        <span>Generate API Key</span>
                       </button>
                     </div>
                   </div>

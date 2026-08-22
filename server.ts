@@ -1,6 +1,9 @@
 import fs from 'fs';
 import axios from 'axios';
 import express from 'express';
+import crypto from 'crypto';
+import cors from 'cors';
+import swaggerUi from 'swagger-ui-express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -298,8 +301,21 @@ const requireAuth = async (req: any, res: any, next: any) => {
   const token = authHeader?.startsWith('Bearer ') ? authHeader.split(' ')[1] : tokenFromQuery;
   if (token) {
     const session = await database.collection('sessions').findOne({ token });
-    if (session) {
-      const user = await database.collection('users').findOne({ _id: session.userId });
+    let targetUserId = session?.userId;
+    
+    if (!session) {
+      const apiKey = await database.collection('api_keys').findOne({ key: token });
+      if (apiKey) {
+        targetUserId = apiKey.userId;
+        database.collection('api_keys').updateOne(
+          { _id: apiKey._id },
+          { $set: { lastUsed: new Date() } }
+        ).catch(() => {});
+      }
+    }
+
+    if (targetUserId) {
+      const user = await database.collection('users').findOne({ _id: targetUserId });
       if (user && user.isActive) {
         req.userId  = user._id;
         req.isAdmin = !!user.isAdmin;
@@ -455,7 +471,11 @@ function normaliseTgFile(f: any) {
 
 // ─── Express app ─────────────────────────────────────────────────────────────
 export const app = express();
+app.use(cors());
 app.use(express.json());
+
+const swaggerDocument = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'swagger.json'), 'utf8'));
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 // ─── Auth routes ─────────────────────────────────────────────────────────────
 app.post('/api/register', async (req, res) => {
@@ -709,6 +729,37 @@ app.post('/api/user/settings', requireAuth, async (req: any, res: any) => {
   res.json({ success: true });
 });
 
+// ─── API Keys ─────────────────────────────────────────────────────────────────
+app.get('/api/user/api-keys', requireAuth, async (req: any, res: any) => {
+  const userId = req.userId;
+  if (!userId) return res.status(401).json({ error: 'User required' });
+  const keys = await req.db.collection('api_keys').find({ userId }).sort({ createdAt: -1 }).toArray();
+  res.json(keys.map((k: any) => ({
+    id: k._id,
+    name: k.name,
+    key: k.key,
+    createdAt: k.createdAt,
+    lastUsed: k.lastUsed
+  })));
+});
+
+app.post('/api/user/api-keys', requireAuth, async (req: any, res: any) => {
+  const userId = req.userId;
+  if (!userId) return res.status(401).json({ error: 'User required' });
+  const { name } = req.body;
+  const newKey = `sk_live_${crypto.randomBytes(32).toString('hex')}`;
+  const doc = { userId, name: name || 'API Key', key: newKey, createdAt: new Date(), lastUsed: null };
+  const result = await req.db.collection('api_keys').insertOne(doc);
+  res.json({ id: result.insertedId, key: newKey, name: doc.name });
+});
+
+app.delete('/api/user/api-keys/:id', requireAuth, async (req: any, res: any) => {
+  const userId = req.userId;
+  if (!userId) return res.status(401).json({ error: 'User required' });
+  await req.db.collection('api_keys').deleteOne({ _id: new ObjectId(req.params.id), userId });
+  res.json({ success: true });
+});
+
 // ─── /api/me ──────────────────────────────────────────────────────────────────
 app.get('/api/me', requireAuth, async (req: any, res: any) => {
   if (req.isAdmin && !req.user) {
@@ -822,6 +873,34 @@ app.delete('/api/accounts/:id', requireAuth, async (req: any, res: any) => {
     query.userId = String(req.userId); 
   }
   await database.collection('accounts').deleteOne(query);
+  res.json({ success: true });
+});
+
+app.post('/api/accounts/google', requireAuth, async (req: any, res: any) => {
+  const { tokens, driveName, email } = req.body;
+  if (!tokens || !tokens.access_token) return res.status(400).json({ error: 'Tokens required' });
+  const doc = {
+    userId: String(req.userId),
+    accountType: 'gdrive',
+    name: driveName || 'Google Drive (API)',
+    email: email || 'api-connected@google.com',
+    tokens
+  };
+  await req.db.collection('accounts').insertOne(doc);
+  res.json({ success: true });
+});
+
+app.post('/api/accounts/onedrive', requireAuth, async (req: any, res: any) => {
+  const { tokens, driveName, email } = req.body;
+  if (!tokens || !tokens.access_token) return res.status(400).json({ error: 'Tokens required' });
+  const doc = {
+    userId: String(req.userId),
+    accountType: 'onedrive',
+    name: driveName || 'OneDrive (API)',
+    email: email || 'api-connected@microsoft.com',
+    tokens
+  };
+  await req.db.collection('accounts').insertOne(doc);
   res.json({ success: true });
 });
 
@@ -1154,6 +1233,21 @@ app.post('/api/share', requireAuth, async (req: any, res: any) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.get('/api/shares', requireAuth, async (req: any, res: any) => {
+  const userId = String(req.userId);
+  const db = req.db;
+  const shares = await db.collection('shares').find({}).toArray();
+  res.json(shares);
+});
+
+app.delete('/api/shares/:shareId', requireAuth, async (req: any, res: any) => {
+  const { shareId } = req.params;
+  const db = req.db;
+  await db.collection('shares').deleteOne({ shareId });
+  await db.collection('tg_files').updateOne({ shareId }, { $unset: { shareId: "" } });
+  res.json({ success: true });
 });
 
 // ─── Move ────────────────────────────────────────────────────────────────────

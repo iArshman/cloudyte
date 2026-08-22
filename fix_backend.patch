@@ -1,0 +1,26 @@
+--- server.ts
++++ server.ts
+@@ -298,6 +298,22 @@
+   const token = authHeader?.startsWith('Bearer ') ? authHeader.split(' ')[1] : tokenFromQuery;
+   if (token) {
+     const session = await database.collection('sessions').findOne({ token });
++    let targetUserId = session?.userId;
++
++    if (!session) {
++       // Check if token is an API key
++       const apiKey = await database.collection('api_keys').findOne({ key: token });
++       if (apiKey) {
++          targetUserId = apiKey.userId;
++          // Update last used async
++          database.collection('api_keys').updateOne(
++             { _id: apiKey._id },
++             { $set: { lastUsed: new Date() } }
++          ).catch(() => {});
++       }
++    }
++
+     if (targetUserId) {
+-      const user = await database.collection('users').findOne({ _id: session.userId });
++      const user = await database.collection('users').findOne({ _id: targetUserId });
+       if (user && user.isActive) {
+         req.userId  = user._id;
