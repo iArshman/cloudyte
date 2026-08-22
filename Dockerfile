@@ -40,7 +40,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 
 # Copy backend files
-COPY server.ts telegram.ts swagger.json ./
+COPY server.ts telegram.ts
 
 # Optional config files
 COPY firebase-applet-config.json* ./
