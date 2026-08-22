@@ -9,14 +9,11 @@ import { motion, AnimatePresence } from 'motion/react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 
-// ─── TelegramIcon SVG ─────────────────────────────────────────────────────────
-function TelegramIcon({ size = 18 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
-      <path d="m20.303 2.38-18 7a.5.5 0 0 0 .076.953l4.382.972 1.818 5.454a.5.5 0 0 0 .844.157l2.425-2.888 4.854 3.56a.5.5 0 0 0 .784-.288L21 2.9a.5.5 0 0 0-.697-.52zm-1.19 1.71-9.452 9.2-2.113-6.337L19.113 4.09z"/>
-    </svg>
-  );
-}
+import ConfirmModal from "./components/modals/ConfirmModal";
+import PromptModal from "./components/modals/PromptModal";
+import DetailRow from "./components/DetailRow";
+import FileIcon from "./components/FileIcon";
+import TelegramIcon from "./components/Icons/TelegramIcon";
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => !!localStorage.getItem('cloudyte_token'));
@@ -55,9 +52,6 @@ export default function App() {
   const [tgRegisterError, setTgRegisterError] = useState('');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ name: string; percent: number } | null>(null);
-  const [apiKeys, setApiKeys] = useState<any[]>([]);
-  const [newApiKeyValue, setNewApiKeyValue] = useState<string | null>(null);
-  const [generatingApiKey, setGeneratingApiKey] = useState(false);
   const [promptModal, setPromptModal]     = useState<{ isOpen: boolean; title: string; defaultValue: string; onConfirm: (val: string) => void; onCancel: () => void } | null>(null);
   const [confirmModal, setConfirmModal]   = useState<{ isOpen: boolean; title: string; message: string; onConfirm: () => void; onCancel: () => void } | null>(null);
   const [promptValue, setPromptValue]     = useState('');
@@ -210,45 +204,6 @@ export default function App() {
   }, [getAuthHeaders]);
 
   useEffect(() => { fetchAccounts(); }, [fetchAccounts]);
-  
-  const fetchApiKeys = useCallback(async () => {
-    try {
-      const res = await fetch('/api/user/api-keys', { headers: getAuthHeaders() });
-      if (res.ok) setApiKeys(await res.json());
-    } catch { /* ignore */ }
-  }, [getAuthHeaders]);
-
-  useEffect(() => { if (isSettingsOpen) fetchApiKeys(); }, [isSettingsOpen, fetchApiKeys]);
-
-  const generateApiKey = async (name: string) => {
-    setGeneratingApiKey(true);
-    try {
-      const res = await fetch('/api/user/api-keys', {
-        method: 'POST',
-        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setNewApiKeyValue(data.key);
-        fetchApiKeys();
-        showToast('API Key generated successfully');
-      }
-    } catch (e: any) { showToast('Error generating key', 'error'); }
-    setGeneratingApiKey(false);
-  };
-
-  const revokeApiKey = async (id: string) => {
-    if (!confirm('Are you sure you want to revoke this API key? Any applications using it will lose access immediately.')) return;
-    try {
-      const res = await fetch(`/api/user/api-keys/${id}`, { method: 'DELETE', headers: getAuthHeaders() });
-      if (res.ok) {
-        fetchApiKeys();
-        showToast('API Key revoked');
-      }
-    } catch (e: any) { showToast('Error revoking key', 'error'); }
-  };
-
   useEffect(() => { const t = setTimeout(() => setDebouncedSearch(searchQuery), 400); return () => clearTimeout(t); }, [searchQuery]);
   useEffect(() => { if (selectedAccountId) fetchFiles(selectedAccountId, currentFolderId, debouncedSearch); }, [selectedAccountId, currentFolderId, debouncedSearch, fetchFiles]);
 
@@ -1537,50 +1492,6 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-
-                  <div className="space-y-4">
-                    <h3 className="text-[10px] font-black uppercase text-slate-400 tracking-[0.2em]">Developer API Keys</h3>
-                    <div className="space-y-3">
-                      {newApiKeyValue && (
-                        <div className="p-4 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-2xl">
-                          <p className="text-sm font-bold text-green-700 dark:text-green-400 mb-2">New API Key Generated!</p>
-                          <p className="text-[10px] text-green-600 dark:text-green-500 mb-3">Copy this key now. You won't be able to see it again.</p>
-                          <div className="flex items-center gap-2 bg-white dark:bg-black/20 p-2 rounded-xl">
-                            <code className="text-xs font-mono flex-1 text-slate-800 dark:text-slate-200 break-all">{newApiKeyValue}</code>
-                            <button onClick={() => { navigator.clipboard.writeText(newApiKeyValue); showToast('Copied to clipboard'); }} className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-slate-500 transition-all">Copy</button>
-                          </div>
-                          <button onClick={() => setNewApiKeyValue(null)} className="mt-3 text-xs font-bold text-green-700 dark:text-green-400 hover:underline">I have saved it</button>
-                        </div>
-                      )}
-                      
-                      {apiKeys.map(key => (
-                        <div key={key.id} className="flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800/50 rounded-2xl group">
-                          <div className="min-w-0 flex-1">
-                            <p className="text-sm font-bold truncate dark:text-white">{key.name}</p>
-                            <div className="flex items-center gap-2 mt-1 pr-2">
-                              <code className="text-[10px] font-mono text-slate-500 truncate bg-slate-100 dark:bg-slate-800 px-2 py-1 rounded">{key.key}</code>
-                              <button onClick={() => { navigator.clipboard.writeText(key.key); showToast('Copied to clipboard'); }} className="text-slate-400 hover:text-purple-500 transition-colors" title="Copy Key"><Copy size={12} /></button>
-                            </div>
-                            <p className="text-[10px] text-slate-400 mt-1">Created: {new Date(key.createdAt).toLocaleDateString()}</p>
-                          </div>
-                          <button onClick={() => revokeApiKey(key.id)} className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-all opacity-0 group-hover:opacity-100" title="Revoke Key"><Trash2 size={16} /></button>
-                        </div>
-                      ))}
-                      
-                      <button onClick={() => {
-                        setPromptModal({
-                          isOpen: true,
-                          title: 'Name your API Key',
-                          defaultValue: 'My App Key',
-                          onConfirm: (val) => generateApiKey(val),
-                          onCancel: () => setPromptModal(null)
-                        });
-                      }} disabled={generatingApiKey} className="w-full flex items-center justify-center gap-2 py-3 border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-2xl text-sm font-bold text-slate-400 hover:text-purple-500 hover:border-purple-500 transition-all disabled:opacity-50">
-                        {generatingApiKey ? <RefreshCw size={16} className="animate-spin" /> : <Plus size={16} />}
-                        <span>Generate API Key</span>
-                      </button>
-                    </div>
-                  </div>
                 </>
               )}
             </div>
@@ -1682,38 +1593,23 @@ export default function App() {
         </AnimatePresence>
 
         {/* Prompt Modal */}
-        <AnimatePresence>
-          {promptModal?.isOpen && (
-            <div className="fixed inset-0 z-[150] flex items-center justify-center p-6">
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={promptModal.onCancel} className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
-              <motion.div initial={{ scale: 0.95, opacity: 0, y: 10 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.95, opacity: 0, y: 10 }} transition={{ duration: 0.15 }} className="bg-white dark:bg-slate-800 p-8 rounded-[2.5rem] shadow-2xl relative w-full max-w-sm space-y-6 border border-slate-200 dark:border-slate-700">
-                <h2 className="text-xl font-black text-slate-900 dark:text-white tracking-tight">{promptModal.title}</h2>
-                <input autoFocus type="text" value={promptValue} onChange={e => setPromptValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') promptModal.onConfirm(promptValue); }} className="w-full px-6 py-4 bg-slate-50 dark:bg-slate-900/50 border-2 border-transparent focus:border-blue-500 rounded-2xl outline-none transition-all font-bold text-slate-700 dark:text-white" />
-                <div className="flex gap-3">
-                  <button onClick={promptModal.onCancel} className="flex-1 py-4 text-slate-500 font-bold hover:bg-slate-50 dark:hover:bg-slate-700/50 rounded-2xl transition-all">Cancel</button>
-                  <button onClick={() => promptModal.onConfirm(promptValue)} className="flex-1 bg-blue-600 text-white font-bold py-4 rounded-2xl hover:bg-blue-700 shadow-xl shadow-blue-500/20 transition-all active:scale-95">Confirm</button>
-                </div>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
+        <PromptModal
+          isOpen={promptModal?.isOpen || false}
+          title={promptModal?.title || ''}
+          value={promptValue}
+          onChange={setPromptValue}
+          onConfirm={() => promptModal?.onConfirm(promptValue)}
+          onCancel={promptModal?.onCancel || (() => {})}
+        />
 
         {/* Confirm Modal */}
-        <AnimatePresence>
-          {confirmModal?.isOpen && (
-            <div className="fixed inset-0 z-[160] flex items-center justify-center p-6">
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={confirmModal.onCancel} className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
-              <motion.div initial={{ scale: 0.95, opacity: 0, y: 10 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.95, opacity: 0, y: 10 }} transition={{ duration: 0.15 }} className="bg-white dark:bg-slate-800 p-8 rounded-[2.5rem] shadow-2xl relative w-full max-w-sm space-y-6 border border-slate-200 dark:border-slate-700">
-                <h2 className="text-xl font-black text-slate-900 dark:text-white tracking-tight">{confirmModal.title}</h2>
-                <p className="text-slate-600 dark:text-slate-300 font-medium">{confirmModal.message}</p>
-                <div className="flex gap-3">
-                  <button onClick={confirmModal.onCancel} className="flex-1 py-4 text-slate-500 font-bold hover:bg-slate-50 dark:hover:bg-slate-700/50 rounded-2xl transition-all">Cancel</button>
-                  <button onClick={confirmModal.onConfirm} className="flex-1 bg-red-600 text-white font-bold py-4 rounded-2xl hover:bg-red-700 shadow-xl shadow-red-500/20 transition-all active:scale-95">Confirm</button>
-                </div>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
+        <ConfirmModal
+          isOpen={confirmModal?.isOpen || false}
+          title={confirmModal?.title || ''}
+          message={confirmModal?.message || ''}
+          onConfirm={confirmModal?.onConfirm || (() => {})}
+          onCancel={confirmModal?.onCancel || (() => {})}
+        />
 
         {/* Context Menu */}
         <AnimatePresence>
@@ -2124,40 +2020,3 @@ export default function App() {
   );
 }
 
-// ─── Helper components ────────────────────────────────────────────────────────
-function DetailRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex justify-between items-center py-3 border-b border-slate-50 dark:border-slate-700/50">
-      <span className="text-[10px] font-black uppercase text-slate-400 tracking-widest">{label}</span>
-      <span className="text-xs font-bold text-slate-700 dark:text-slate-300">{value}</span>
-    </div>
-  );
-}
-
-function FileIcon({ file, type, size = 'sm', isTg = false, accountId, showThumbnails = true }: { file?: any; type: string; size?: 'sm' | 'lg'; isTg?: boolean; accountId?: string | null; showThumbnails?: boolean }) {
-  const container = size === 'lg' ? 'w-20 h-20 rounded-3xl' : 'w-10 h-10 rounded-xl';
-  const iconSize  = size === 'lg' ? 32 : 18;
-  const base      = `${container} flex items-center justify-center shrink-0 shadow-sm transition-all`;
-
-  if (file?.type === 'image' && accountId && showThumbnails) {
-    const token = localStorage.getItem('cloudyte_token');
-    const url = `/api/download/${accountId}/${file.id}?preview=1&token=${token}`;
-    return (
-      <div className={`${container} shrink-0 overflow-hidden shadow-sm bg-slate-100 dark:bg-slate-800`}>
-        <img src={url} alt={file.name} className="w-full h-full object-cover" loading="lazy" />
-      </div>
-    );
-  }
-
-  if (type === 'folder') return <div className={`${base} bg-amber-50 dark:bg-amber-900/20 text-amber-500 group-hover:scale-110`}><Folder size={iconSize} fill="currentColor" /></div>;
-  if (isTg)             return <div className={`${base} bg-sky-50 dark:bg-sky-900/20 text-sky-500 group-hover:scale-110`}><TelegramIcon size={iconSize} /></div>;
-  if (type === 'pdf')   return <div className={`${base} bg-rose-50 dark:bg-rose-900/20 text-rose-500`}><FileIconLucide size={iconSize} /></div>;
-  if (type === 'image') return <div className={`${base} bg-blue-50 dark:bg-blue-900/20 text-blue-500 group-hover:scale-110`}><Eye size={iconSize} /></div>;
-  if (type === 'audio') return <div className={`${base} bg-pink-50 dark:bg-pink-900/20 text-pink-500 group-hover:scale-110`}><RefreshCw size={iconSize} /></div>;
-  if (type === 'video') return <div className={`${base} bg-purple-50 dark:bg-purple-900/20 text-purple-500 group-hover:scale-110`}><Video size={iconSize} /></div>;
-  if (type === 'sheet') return <div className={`${base} bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600`}><HardDrive size={iconSize} /></div>;
-  if (type === 'doc')   return <div className={`${base} bg-blue-50 dark:bg-blue-900/20 text-blue-600`}><FileIconLucide size={iconSize} /></div>;
-  if (type === 'slide') return <div className={`${base} bg-orange-50 dark:bg-orange-900/20 text-orange-600`}><LayoutGrid size={iconSize} /></div>;
-  if (type === 'zip')   return <div className={`${base} bg-slate-100 dark:bg-slate-800 text-slate-600`}><Settings size={iconSize} /></div>;
-  return <div className={`${base} bg-slate-50 dark:bg-slate-900 text-slate-400`}><FileIconLucide size={iconSize} /></div>;
-}
