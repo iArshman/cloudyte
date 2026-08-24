@@ -1163,7 +1163,12 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
   const database = req.db;
 
   if (sourceAccountId !== targetAccountId) {
-    return res.status(400).json({ error: 'Cross-account moving is not supported yet' });
+    try {
+      await crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, true);
+      return res.json({ success: true });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
   }
 
   const query: any = { _id: new ObjectId(sourceAccountId) };
@@ -1219,7 +1224,12 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
   const database = req.db;
 
   if (sourceAccountId !== targetAccountId) {
-    return res.status(400).json({ error: 'Cross-account copying is not supported yet' });
+    try {
+      await crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, false);
+      return res.json({ success: true });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
   }
 
   const query: any = { _id: new ObjectId(sourceAccountId) };
@@ -1493,6 +1503,144 @@ const bot = initBot({
   MICROSOFT_CLIENT_ID,
   MICROSOFT_REDIRECT_URI,
 });
+
+
+async function crossAccountTransfer(
+  sourceAccountId,
+  fileId,
+  targetAccountId,
+  targetFolderId,
+  userId,
+  isAdmin,
+  database,
+  isMove
+) {
+  const querySource = { _id: new ObjectId(sourceAccountId) };
+  if (!isAdmin && userId) querySource.userId = String(userId);
+  const sourceAccount = await database.collection('accounts').findOne(querySource);
+  if (!sourceAccount) throw new Error('Source account not found');
+
+  const queryTarget = { _id: new ObjectId(targetAccountId) };
+  if (!isAdmin && userId) queryTarget.userId = String(userId);
+  const targetAccount = await database.collection('accounts').findOne(queryTarget);
+  if (!targetAccount) throw new Error('Target account not found');
+
+  const tmpPath = path.join('/tmp', `transfer_${Date.now()}_${nanoid(6)}`);
+  const writeStream = fs.createWriteStream(tmpPath);
+  
+  let fileName = 'unknown';
+  let mimeType = 'application/octet-stream';
+
+  try {
+    if (sourceAccount.accountType === 'tgdrive') {
+      const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
+      if (!meta) throw new Error('File not found in TG');
+      fileName = meta.name;
+      mimeType = meta.mimeType;
+      
+      const telegram = await getTgClient();
+      const peer = await resolvePeer(telegram, sourceAccount.channelId);
+      const messages = await telegram.getMessages(peer, { ids: [meta.messageId] });
+      if (!messages || !messages[0] || !messages[0].media) throw new Error('Message not found');
+      
+      for await (const chunk of telegram.iterDownload({ file: messages[0].media, requestSize: 1024 * 1024 })) {
+        writeStream.write(chunk);
+      }
+      writeStream.end();
+      await new Promise((res, rej) => { writeStream.on('finish', res); writeStream.on('error', rej); });
+    } else if (sourceAccount.accountType === 'onedrive') {
+      const c = await getOneDriveClient(sourceAccount.tokens, sourceAccount._id.toString());
+      const item = await c.api(`/me/drive/items/${fileId}`).get();
+      fileName = item.name;
+      mimeType = item.file?.mimeType || mimeType;
+
+      const dlUrl = item['@microsoft.graph.downloadUrl'];
+      if (!dlUrl) throw new Error('Download link not available');
+      const response = await axios.get(dlUrl, { responseType: 'stream' });
+      response.data.pipe(writeStream);
+      await new Promise((res, rej) => { writeStream.on('finish', res); writeStream.on('error', rej); });
+    } else if (sourceAccount.accountType === 'google') {
+      const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
+      const file = await drive.files.get({ fileId, fields: 'name,mimeType' });
+      fileName = file.data.name || 'unknown';
+      mimeType = file.data.mimeType || mimeType;
+      
+      const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+      response.data.pipe(writeStream);
+      await new Promise((res, rej) => { writeStream.on('finish', res); writeStream.on('error', rej); });
+    }
+
+    const stat = fs.statSync(tmpPath);
+    
+    if (targetAccount.accountType === 'tgdrive') {
+      const folder = (!targetFolderId || targetFolderId === 'root') ? '' : targetFolderId;
+      const telegram = await getTgClient();
+      const peerEntity = await resolvePeer(telegram, targetAccount.channelId);
+      const result = await telegram.sendFile(peerEntity, {
+        file: tmpPath,
+        forceDocument: true,
+        attributes: [new Api.DocumentAttributeFilename({ fileName })],
+      });
+      
+      const record = {
+        accountId: targetAccount._id,
+        messageId: result.id,
+        shareId: nanoid(6),
+        name: fileName,
+        size: stat.size,
+        mimeType,
+        folder,
+        date: Math.floor(Date.now() / 1000),
+      };
+      await database.collection('tg_files').insertOne(record);
+    } else if (targetAccount.accountType === 'onedrive') {
+      const c = await getOneDriveClient(targetAccount.tokens, targetAccount._id.toString());
+      const parentPath = (!targetFolderId || targetFolderId === 'root') ? '/me/drive/root' : `/me/drive/items/${targetFolderId}`;
+      const encodedName = encodeURIComponent(fileName);
+      
+      if (stat.size <= 4 * 1024 * 1024) {
+        const buf = fs.readFileSync(tmpPath);
+        await c.api(`${parentPath}:/${encodedName}:/content`).put(buf);
+      } else {
+        const uploadSession = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: fileName } });
+        const uploadUrl = uploadSession.uploadUrl;
+        const chunkSize = 320 * 1024 * 10;
+        for (let start = 0; start < stat.size; start += chunkSize) {
+          const end = Math.min(start + chunkSize, stat.size);
+          const chunk = fs.readFileSync(tmpPath, { start, end: end - 1 });
+          await axios.put(uploadUrl, chunk, { headers: { 'Content-Range': `bytes ${start}-${end - 1}/${stat.size}`, 'Content-Length': chunk.length } });
+        }
+      }
+    } else if (targetAccount.accountType === 'google') {
+      const drive = await getDriveClient(targetAccount.tokens || targetAccount.credentials);
+      const readStream = fs.createReadStream(tmpPath);
+      await drive.files.create({
+        requestBody: { name: fileName, parents: [targetFolderId || 'root'] },
+        media: { mimeType, body: readStream }
+      });
+    }
+
+    if (isMove) {
+      if (sourceAccount.accountType === 'tgdrive') {
+        const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(fileId) });
+        if (meta) {
+           const telegram = await getTgClient();
+           const peer = await resolvePeer(telegram, sourceAccount.channelId);
+           await telegram.deleteMessages(peer, [meta.messageId], { revoke: true });
+           await database.collection('tg_files').deleteOne({ _id: meta._id });
+        }
+      } else if (sourceAccount.accountType === 'onedrive') {
+        const c = await getOneDriveClient(sourceAccount.tokens, sourceAccount._id.toString());
+        await c.api(`/me/drive/items/${fileId}`).delete();
+      } else if (sourceAccount.accountType === 'google') {
+        const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
+        await drive.files.delete({ fileId });
+      }
+    }
+  } finally {
+    if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+  }
+}
 
 // ─── Vite / static ────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'production') {
