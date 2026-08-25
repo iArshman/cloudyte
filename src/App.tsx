@@ -864,13 +864,9 @@ export default function App() {
   if (isInitializing || (isAuthenticated && !userProfile)) {
     return (
       <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center gap-4">
-        <motion.div 
-          animate={{ rotate: 360 }} 
-          transition={{ repeat: Infinity, duration: 1, ease: 'linear' }} 
-          className="text-blue-500"
-        >
-          <RefreshCw size={48} />
-        </motion.div>
+        <div className="text-blue-500 animate-pulse">
+          <Cloud size={48} />
+        </div>
         <p className="text-slate-500 font-bold text-sm">Initializing Cloudyte...</p>
       </div>
     );
@@ -884,7 +880,7 @@ export default function App() {
 
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 bg-[radial-gradient(circle_at_50%_-20%,#1e293b,transparent)]">
-        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }} className="bg-white dark:bg-slate-800 p-8 rounded-[2.5rem] shadow-2xl max-w-md w-full border border-slate-100 dark:border-slate-700">
+        <div className="bg-white dark:bg-slate-800 p-8 rounded-[2.5rem] shadow-2xl max-w-md w-full border border-slate-100 dark:border-slate-700">
           <div className="w-20 h-20 bg-blue-700 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-xl shadow-blue-900/20">
             <Cloud size={40} className="text-white" />
           </div>
@@ -957,7 +953,7 @@ export default function App() {
               </>
             )}
           </div>
-        </motion.div>
+        </div>
       </div>
     );
   }

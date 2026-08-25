@@ -1,27 +1,47 @@
 # Cloudyte API Documentation
 
-This document provides a detailed overview of all the API endpoints available in the backend. 
-You can use these endpoints to build a custom Android app, desktop client, or alternative web frontend.
+This document provides a comprehensive, production-ready guide to all backend REST API endpoints and OAuth workflows in Cloudyte.
+You can use this specification to integrate custom Android / iOS apps, desktop clients, command-line tools, or custom web frontends.
 
 ---
 
-## 1. Authentication
+## 1. Architecture & Base URL
 
-Most endpoints require authentication. To authenticate, include the `Authorization` header with a Bearer token or provide a `token` query parameter.
+All API routes are served under the root URL of your deployed Cloudyte server.
 
-**Header Format:**
-```
-Authorization: Bearer <your_session_token>
-```
-*Note: Admin endpoints can also be accessed using Basic Auth if you have the direct admin credentials: `Authorization: Basic <base64(admin:password)>`.*
+- **Base URL Example:** `https://your-domain.com` (or `http://localhost:3000` in local development)
+- **Content Type:** JSON (`application/json`) is expected for POST/PATCH bodies, except for `/api/upload/:accountId` which requires `multipart/form-data`.
+- **Media Streaming:** Video, audio, and large file download endpoints support HTTP `Range` requests (`206 Partial Content`) for native media players (such as Android ExoPlayer / AVPlayer).
 
 ---
 
-## 2. Public / Auth Endpoints
+## 2. Authentication
 
-### Get Public Settings
-Returns the public registration settings (e.g., whether registration is enabled).
-- **URL:** `GET /api/public/settings`
+Most endpoints require user authentication. Supply the session token returned by `/api/login` in the standard HTTP `Authorization` header:
+
+```http
+Authorization: Bearer <session_token>
+```
+
+*Alternative Query Parameter:*
+For media downloads or WebView rendering where setting custom headers is difficult, you can pass the token as a query parameter:
+```
+GET /api/download/:accountId/:fileId?token=<session_token>
+```
+
+*Admin Basic Auth:*
+Admin endpoints also accept HTTP Basic Auth using the root credentials:
+```http
+Authorization: Basic <base64(admin_username:admin_password)>
+```
+
+---
+
+## 3. Public & Auth Endpoints
+
+### 3.1 Get Public Settings
+Returns the global registration policy.
+- **Method & Route:** `GET /api/public/settings`
 - **Auth Required:** No
 - **Response:**
   ```json
@@ -32,271 +52,476 @@ Returns the public registration settings (e.g., whether registration is enabled)
   }
   ```
 
-### User Registration
-Register a new account.
-- **URL:** `POST /api/register`
+### 3.2 User Registration
+Register a new user account if public registration is enabled.
+- **Method & Route:** `POST /api/register`
 - **Auth Required:** No
-- **Body:** (JSON)
+- **Request Body (JSON):**
   ```json
   {
-    "username": "myuser",
-    "password": "mypassword"
+    "username": "alice",
+    "password": "strongpassword123"
   }
   ```
-- **Response:** `{ "success": true }`
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true
+  }
+  ```
+- **Errors:** `400 Bad Request` (missing fields, username taken, registration disabled).
 
-### User Login
-Authenticate and receive a session token.
-- **URL:** `POST /api/login`
+### 3.3 User Login
+Authenticate with username and password to receive a persistent session token.
+- **Method & Route:** `POST /api/login`
 - **Auth Required:** No
-- **Body:** (JSON)
+- **Request Body (JSON):**
   ```json
   {
-    "username": "myuser",
-    "password": "mypassword"
+    "username": "alice",
+    "password": "strongpassword123"
   }
   ```
-- **Response:**
+- **Response (200 OK):**
   ```json
   {
     "success": true,
-    "token": "a1b2c3d4...",
-    "username": "myuser",
+    "token": "4f8a9e2b1c7d...",
+    "username": "alice",
     "isAdmin": false
   }
   ```
+- **Errors:** `401 Unauthorized` (invalid credentials or deactivated account).
 
-### Logout
-Invalidate the current session token.
-- **URL:** `POST /api/logout`
+### 3.4 Logout
+Terminates and invalidates the session token in the database.
+- **Method & Route:** `POST /api/logout`
 - **Auth Required:** Yes
-- **Response:** `{ "success": true }`
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true
+  }
+  ```
 
 ---
 
-## 3. Current User / Accounts
+## 4. User Profile & Settings
 
-### Get Current User Profile
-Retrieves the logged-in user's profile and settings.
-- **URL:** `GET /api/me`
+### 4.1 Get Current User Profile
+Retrieves the logged-in user's profile and preferences.
+- **Method & Route:** `GET /api/me`
 - **Auth Required:** Yes
-- **Response:**
+- **Response (200 OK):**
   ```json
   {
     "authenticated": true,
-    "username": "myuser",
+    "username": "alice",
     "isAdmin": false,
     "settings": {
-      "username": "myuser",
-      "backupEnabled": false,
-      "backupAccId": null
+      "username": "alice",
+      "backupEnabled": true,
+      "backupAccId": "65d8a1f2e4b0...",
+      "isDefaultAccId": "65d8a1f2e4b0..."
     }
   }
   ```
 
-### Update User Settings
-- **URL:** `POST /api/user/settings`
+### 4.2 Update User Settings
+Configures default storage drive and automated backup drive preferences.
+- **Method & Route:** `POST /api/user/settings`
 - **Auth Required:** Yes
-- **Body:** (JSON)
+- **Request Body (JSON):**
   ```json
   {
     "backupEnabled": true,
-    "backupAccId": "account_id_here",
-    "isDefaultAccId": "account_id_here"
+    "backupAccId": "65d8a1f2e4b0...",
+    "isDefaultAccId": "65d8a1f2e4b0..."
   }
   ```
-- **Response:** `{ "success": true }`
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true
+  }
+  ```
 
-### List Linked Accounts (Drives)
-List all drives (Telegram, Google Drive, OneDrive) connected to the current user.
-- **URL:** `GET /api/accounts`
+---
+
+## 5. Storage Accounts & Drive Linking (Google Drive, OneDrive, Telegram)
+
+Cloudyte supports multi-cloud storage drives linked to a user profile.
+
+### 5.1 List Linked Accounts (Drives)
+Fetches all drives connected to the current user (Google Drive, OneDrive, Telegram Drive), along with real-time storage quota and usage.
+- **Method & Route:** `GET /api/accounts`
 - **Auth Required:** Yes
-- **Query Params:** `userId` (Admin only - filters by user)
-- **Response:** Array of account objects with storage usage.
+- **Query Params:** `userId` *(Optional, Admin only - view drives of a specific user)*
+- **Response (200 OK):**
   ```json
   [
     {
-      "id": "abc...",
-      "name": "My TG Drive",
-      "email": "Channel: -10012345678",
+      "id": "65d8a1f2e4b0111111111111",
+      "name": "My Telegram Drive",
+      "email": "Channel: -1001987654321",
       "accountType": "tgdrive",
-      "usage": "1.5 GB",
+      "usage": "2.40 GB",
       "total": "∞",
       "percentage": 0,
-      "fileCount": 150,
+      "fileCount": 42,
       "isDefault": true
+    },
+    {
+      "id": "65d8a1f2e4b0222222222222",
+      "name": "Alice Google Drive",
+      "email": "alice@gmail.com",
+      "accountType": "google",
+      "usage": "11.20 GB",
+      "total": "15.00 GB",
+      "percentage": 74.6,
+      "fileCount": 180,
+      "isDefault": false
+    },
+    {
+      "id": "65d8a1f2e4b0333333333333",
+      "name": "Alice OneDrive",
+      "email": "alice@outlook.com",
+      "accountType": "onedrive",
+      "usage": "1.80 GB",
+      "total": "5.00 GB",
+      "percentage": 36.0,
+      "fileCount": 55,
+      "isDefault": false
     }
   ]
   ```
 
-### Delete/Unlink Account
-- **URL:** `DELETE /api/accounts/:id`
+### 5.2 Delete / Unlink Account
+Disconnects a storage provider from the user's account.
+- **Method & Route:** `DELETE /api/accounts/:id`
 - **Auth Required:** Yes
-- **Response:** `{ "success": true }`
-
-### Register Telegram Drive
-Links a Telegram channel as a storage drive.
-- **URL:** `POST /api/tgdrive/register`
-- **Auth Required:** Yes
-- **Body:** (JSON)
-  ```json
-  {
-    "channelId": "-10012345678",
-    "driveName": "My Movies Drive"
-  }
-  ```
-- **Response:** `{ "success": true, "id": "acc_id", "channelId": "-10012345678", "name": "My Movies Drive" }`
+- **Response (200 OK):** `{ "success": true }`
 
 ---
 
-## 4. File Operations
+### 5.3 Google Drive & OneDrive Linking Workflows (OAuth & Base URL Guide)
 
-### List Files and Folders
-Get files for a specific account and folder.
-- **URL:** `GET /api/files`
-- **Auth Required:** Yes
-- **Query Params:**
-  - `accountId` (required): ID of the drive/account
-  - `folderId` (optional): ID of the folder (use `root` or omit for top level)
-  - `search` (optional): Search query string
-- **Response:** Array of file/folder objects.
+When building an Android app or client that needs to link Google Drive or Microsoft OneDrive, the flow uses the server's **Base URL** for OAuth authorization and callback handling.
 
-### Create Folder
-- **URL:** `POST /api/folders`
-- **Auth Required:** Yes
-- **Query Params:** `accountId` (required)
-- **Body:** (JSON)
+#### How the OAuth Linking Architecture Works:
+1. **Server Base URL (`APP_URL`):**
+   The Cloudyte server is configured with an `APP_URL` (for example `https://cloudyte.example.com`). The OAuth callback URLs are registered as:
+   - Google: `${APP_URL}/auth/google/callback`
+   - Microsoft OneDrive: `${APP_URL}/auth/microsoft/callback` (or configured via `MICROSOFT_REDIRECT_URI`)
+2. **Session State Handshake:**
+   When the client requests an authorization URL, the server signs the OAuth `state` parameter with the user's active session token. When Google/Microsoft redirects back to the callback URL, the server verifies the `state`, attributes the tokens to the correct user ID in MongoDB, and completes the link.
+
+#### 5.3.1 Google Drive OAuth Linking Endpoint
+Generates the Google OAuth consent URL for the authenticated user.
+- **Method & Route:** `GET /api/auth/drive-link`
+- **Auth Required:** Yes (`Authorization: Bearer <session_token>`)
+- **Response (200 OK):**
   ```json
   {
-    "name": "New Folder Name",
-    "parentId": "root" // or specific folder ID
+    "url": "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.profile&prompt=consent&response_type=code&client_id=...&redirect_uri=https%3A%2F%2Fyour-server.com%2Fauth%2Fgoogle%2Fcallback&state=<session_token>"
   }
   ```
-- **Response:** `{ "success": true }`
 
-### Upload File
-- **URL:** `POST /api/upload/:accountId`
-- **Auth Required:** Yes
-- **Body:** (Multipart Form-Data)
-  - `file`: The actual file payload
-  - `folderId`: The ID of the parent folder (or "root")
-- **Response:** `{ "success": true }`
-
-### Download File
-- **URL:** `GET /api/download/:accountId/:fileId`
-- **Auth Required:** Yes
-- **Query Params:**
-  - `preview=1` (optional): Sets Content-Disposition to inline (useful for images/videos in-app)
-- **Response:** Binary file stream. Supports `Range` headers for video streaming.
-
-### Rename File
-- **URL:** `PATCH /api/files/:fileId`
-- **Auth Required:** Yes
-- **Query Params:** `accountId` (required)
-- **Body:** (JSON)
+#### 5.3.2 OneDrive OAuth Linking Endpoint
+Generates the Microsoft OneDrive OAuth consent URL for the authenticated user.
+- **Method & Route:** `GET /api/auth/onedrive-link`
+- **Auth Required:** Yes (`Authorization: Bearer <session_token>`)
+- **Response (200 OK):**
   ```json
   {
-    "name": "new_name.mp4"
+    "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=...&response_type=code&redirect_uri=https%3A%2F%2Fyour-server.com%2Fauth%2Fmicrosoft%2Fcallback&response_mode=query&scope=files.readwrite.all+User.Read+offline_access&state=<session_token>&prompt=select_account"
   }
   ```
-- **Response:** `{ "success": true }`
 
-### Delete File
-- **URL:** `DELETE /api/files/:fileId`
-- **Auth Required:** Yes
-- **Query Params:** `accountId` (required)
-- **Response:** `{ "success": true }`
+#### 5.3.3 Android / Native Client Integration Steps for OAuth:
+1. **Call the Link Endpoint:** In your native app, make an authorized HTTP GET call to `GET /api/auth/drive-link` or `GET /api/auth/onedrive-link`.
+2. **Open in Custom Tab / WebView:**
+   - Launch the returned `url` in **Android Chrome Custom Tabs** or an in-app browser with cookies enabled.
+3. **Consent & Callback Execution:**
+   - The user signs in and accepts permissions on Google / Microsoft.
+   - Google / Microsoft redirects to `${BASE_URL}/auth/google/callback?code=...&state=...` (or `${BASE_URL}/auth/microsoft/callback`).
+   - The Cloudyte server automatically exchanges the authorization code for refresh tokens, saves the linked account to the database, and responds with a success HTML page that calls `window.close()`.
+4. **Refresh Accounts List in App:**
+   - On returning to the app (e.g. `onResume` / Custom Tab closed), call `GET /api/accounts` to refresh the user's linked drives.
 
-### Move File
-- **URL:** `POST /api/files/move`
-- **Auth Required:** Yes
-- **Body:** (JSON)
-  ```json
-  {
-    "sourceAccountId": "acc_id",
-    "fileId": "file_id",
-    "targetAccountId": "acc_id",
-    "targetFolderId": "folder_id"
-  }
-  ```
-- **Response:** `{ "success": true }`
-
-### Copy File
-- **URL:** `POST /api/files/copy`
-- **Auth Required:** Yes
-- **Body:** (JSON)
-  ```json
-  {
-    "sourceAccountId": "acc_id",
-    "fileId": "file_id",
-    "targetAccountId": "acc_id",
-    "targetFolderId": "folder_id"
-  }
-  ```
-- **Response:** `{ "success": true }`
-
-### Share File (Generate Link)
-Generates a public URL to view/download a file without auth.
-- **URL:** `POST /api/share`
-- **Auth Required:** Yes
-- **Body:** (JSON)
-  ```json
-  {
-    "accountId": "acc_id",
-    "fileId": "file_id"
-  }
-  ```
-- **Response:** `{ "success": true, "shareUrl": "https://.../s/123456" }`
+#### 5.3.4 Direct Telegram OAuth Route (Optional)
+Used when initiating linking from Telegram Bot interactions:
+- **Route:** `GET /auth/link?tgId=<telegram_user_id>`
 
 ---
 
-## 5. Public Share Links (No Auth Required)
+### 5.4 Register Telegram Storage Drive
+Links a private or public Telegram channel as an unlimited cloud storage drive.
+*(Note: The Cloudyte bot must be added as an Administrator with post/upload permissions in the Telegram channel).*
+- **Method & Route:** `POST /api/tgdrive/register`
+- **Auth Required:** Yes
+- **Request Body (JSON):**
+  ```json
+  {
+    "channelId": "-1001987654321",
+    "driveName": "My Telegram Cloud"
+  }
+  ```
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "id": "65d8a1f2e4b0111111111111",
+    "channelId": "-1001987654321",
+    "name": "My Telegram Cloud"
+  }
+  ```
+- **Errors:** `400 Bad Request` (missing channel ID or bot lacks admin permissions in channel).
 
-### Download Shared File
-- **URL:** `GET /api/public/download/:shareId`
+---
+
+## 6. File & Folder Operations
+
+### 6.1 List Files and Folders
+Fetches files and subfolders within a specific account and directory.
+- **Method & Route:** `GET /api/files`
+- **Auth Required:** Yes
+- **Query Parameters:**
+  - `accountId` *(Required)*: ID of the storage account/drive.
+  - `folderId` *(Optional)*: Folder ID to view (use `"root"` or omit for the root directory).
+  - `search` *(Optional)*: Search keyword to filter items by name.
+- **Response (200 OK):**
+  ```json
+  [
+    {
+      "id": "65d8a2a1e4b0...",
+      "name": "Photos",
+      "type": "folder",
+      "size": "--",
+      "updatedAt": "2026-08-20T14:32:00.000Z",
+      "isShared": false
+    },
+    {
+      "id": "65d8a2b5e4b0...",
+      "name": "presentation.pdf",
+      "type": "pdf",
+      "size": "4.2 MB",
+      "rawSize": 4404019,
+      "updatedAt": "2026-08-22T09:15:00.000Z",
+      "mimeType": "application/pdf",
+      "isShared": false,
+      "shareId": null
+    }
+  ]
+  ```
+
+### 6.2 Create Folder
+Creates a new directory in the selected drive.
+- **Method & Route:** `POST /api/folders?accountId=:accountId`
+- **Auth Required:** Yes
+- **Request Body (JSON):**
+  ```json
+  {
+    "name": "Documents",
+    "parentId": "root"
+  }
+  ```
+- **Response (200 OK):** `{ "success": true }`
+
+### 6.3 Upload File
+Uploads a file to a specific storage drive and destination folder.
+- **Method & Route:** `POST /api/upload/:accountId`
+- **Auth Required:** Yes
+- **Content-Type:** `multipart/form-data`
+- **Form Fields:**
+  - `file`: Binary file data.
+  - `folderId`: Target folder ID (or `"root"`).
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true
+  }
+  ```
+
+### 6.4 Download or Stream File
+Streams or downloads a file from any linked drive (Telegram, Google Drive, OneDrive).
+- **Method & Route:** `GET /api/download/:accountId/:fileId`
+- **Auth Required:** Yes (`Authorization` header or `?token=<session_token>`)
+- **Query Parameters:**
+  - `preview=1` *(Optional)*: Sets `Content-Disposition: inline` instead of `attachment`, enabling in-app preview for images, PDFs, and video playback.
+- **HTTP Range Support:** Full support for `Range: bytes=start-end` and `206 Partial Content` (for video seek and streaming).
+
+### 6.5 Rename File
+Renames an existing file or folder.
+- **Method & Route:** `PATCH /api/files/:fileId?accountId=:accountId`
+- **Auth Required:** Yes
+- **Request Body (JSON):**
+  ```json
+  {
+    "name": "updated_document_name.pdf"
+  }
+  ```
+- **Response (200 OK):** `{ "success": true }`
+
+### 6.6 Delete File
+Permanently removes a file or folder.
+- **Method & Route:** `DELETE /api/files/:fileId?accountId=:accountId`
+- **Auth Required:** Yes
+- **Response (200 OK):** `{ "success": true }`
+
+---
+
+## 7. Move & Copy Endpoints (Same-Drive & Cross-Drive Transfer)
+
+Cloudyte features a unified file movement and cloning engine that supports both **intra-drive operations** and **seamless cross-cloud transfers** (e.g. moving a file from Telegram Drive to Google Drive, or copying between two OneDrive accounts).
+
+### 7.1 Move File (`POST /api/files/move`)
+Moves a file or folder to a new directory within the same account, or transfers it across different linked storage accounts.
+
+- **Method & Route:** `POST /api/files/move`
+- **Auth Required:** Yes
+- **Request Body (JSON):**
+  ```json
+  {
+    "sourceAccountId": "65d8a1f2e4b0111111111111",
+    "fileId": "65d8a2b5e4b0222222222222",
+    "targetAccountId": "65d8a1f2e4b0333333333333",
+    "targetFolderId": "root"
+  }
+  ```
+- **Field Details:**
+  - `sourceAccountId` *(string, required)*: The account/drive where the file currently resides.
+  - `fileId` *(string, required)*: The unique ID of the file to move.
+  - `targetAccountId` *(string, required)*: The target account/drive (can be equal to `sourceAccountId` or a different drive).
+  - `targetFolderId` *(string, required)*: Destination folder ID (use `"root"` for top-level root folder).
+- **Execution Behaviors:**
+  - **Same-Account Move (`sourceAccountId === targetAccountId`):**
+    - *Telegram Drive:* Instantly updates the folder parent pointer in MongoDB.
+    - *Google Drive:* Invokes Google Drive API `drive.files.update` with `addParents` and `removeParents`.
+    - *OneDrive:* Invokes Microsoft Graph API `PATCH /me/drive/items/{id}` with `parentReference`.
+  - **Cross-Account Transfer (`sourceAccountId !== targetAccountId`):**
+    - Streams the file from the source drive into a temporary local buffer (`/tmp`).
+    - Uploads the file stream into the target drive under `targetFolderId`.
+    - Automatically deletes the original file from the source drive upon successful transfer.
+    - Cleans up the temporary buffer.
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true
+  }
+  ```
+- **Errors:**
+  - `400 Bad Request` (invalid account or unsupported drive type)
+  - `404 Not Found` (source file or account does not exist / does not belong to user)
+  - `500 Internal Server Error` (transfer or permission failure)
+
+---
+
+### 7.2 Copy File (`POST /api/files/copy`)
+Duplicates a file in the destination directory or clones it across different storage providers without altering the source file.
+
+- **Method & Route:** `POST /api/files/copy`
+- **Auth Required:** Yes
+- **Request Body (JSON):**
+  ```json
+  {
+    "sourceAccountId": "65d8a1f2e4b0111111111111",
+    "fileId": "65d8a2b5e4b0222222222222",
+    "targetAccountId": "65d8a1f2e4b0333333333333",
+    "targetFolderId": "root"
+  }
+  ```
+- **Field Details:**
+  - `sourceAccountId` *(string, required)*: The account/drive of the source file.
+  - `fileId` *(string, required)*: The unique ID of the file to copy.
+  - `targetAccountId` *(string, required)*: The destination account/drive.
+  - `targetFolderId` *(string, required)*: Destination folder ID (`"root"` or specific folder ID).
+- **Execution Behaviors:**
+  - **Same-Account Copy (`sourceAccountId === targetAccountId`):**
+    - *Telegram Drive:* Clones the metadata document in MongoDB. If copied into the same folder, automatically appends `" - Copy"` to the filename (e.g. `report - Copy.pdf`).
+    - *Google Drive:* Calls Google Drive API `drive.files.copy` with target parent.
+    - *OneDrive:* Calls Microsoft Graph API `POST /me/drive/items/{id}/copy` with target parent reference.
+  - **Cross-Account Copy (`sourceAccountId !== targetAccountId`):**
+    - Streams the source file to a temporary buffer.
+    - Uploads the cloned file to the target account.
+    - Preserves the original file untouched in the source account.
+    - Cleans up the temporary buffer.
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true
+  }
+  ```
+
+---
+
+## 8. Public Share Links
+
+### 8.1 Create Public Share Link
+Generates a short shareable URL for any file (allows public access without authentication).
+- **Method & Route:** `POST /api/share`
+- **Auth Required:** Yes
+- **Request Body (JSON):**
+  ```json
+  {
+    "accountId": "65d8a1f2e4b0111111111111",
+    "fileId": "65d8a2b5e4b0222222222222"
+  }
+  ```
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "shareUrl": "https://your-domain.com/s/a1b2c3"
+  }
+  ```
+
+### 8.2 Public Direct Download
+Direct binary file stream for shared files (no auth required).
+- **Method & Route:** `GET /api/public/download/:shareId`
 - **Auth Required:** No
-- **Response:** Binary file stream.
+- **Response:** Binary file stream with `Content-Disposition: attachment`. Supports video range streaming.
 
-### View Shared File Webpage
-- **URL:** `GET /s/:shareId`
+### 8.3 Public Share Landing Page
+HTML preview and download web page for end users.
+- **Method & Route:** `GET /s/:shareId`
 - **Auth Required:** No
-- **Response:** HTML page to view/download the file.
+- **Response:** Styled HTML landing page with file metadata, thumbnail preview, and direct download button.
 
 ---
 
-## 6. Admin Endpoints
+## 9. Admin Endpoints
 
-All endpoints below require the authenticated user to have `isAdmin: true` (or use the Basic Auth credentials).
+All admin endpoints require an authenticated session where `isAdmin: true` or HTTP Basic Auth.
 
-### Get Dashboard Stats
-- **URL:** `GET /api/admin/stats`
-- **Response:** `{ "totalUsers": 10, "totalAccounts": 15, "totalFiles": 100 }`
+### 9.1 Get Platform Stats
+- **Route:** `GET /api/admin/stats`
+- **Response:** `{ "totalUsers": 12, "totalAccounts": 25, "totalFiles": 1420 }`
 
-### List All Users
-- **URL:** `GET /api/admin/users`
-- **Response:** Array of user objects with account counts.
+### 9.2 List All Users
+- **Route:** `GET /api/admin/users`
+- **Response:** Array of user records with creation date, account status, and linked account count.
 
-### Get Single User Details
-- **URL:** `GET /api/admin/users/:id`
-- **Response:** `{ "user": {...}, "accounts": [...], "stats": { "fileCount": 5 } }`
+### 9.3 Get User Details & Accounts
+- **Route:** `GET /api/admin/users/:id`
+- **Response:** Detailed user record, list of linked drives, and storage stats.
 
-### Toggle User Active Status
-Ban or unban a user.
-- **URL:** `POST /api/admin/users/:id/toggle`
+### 9.4 Toggle User Active / Suspended
+- **Route:** `POST /api/admin/users/:id/toggle`
 - **Response:** `{ "success": true, "isActive": false }`
 
-### Delete User
-Permanently deletes the user and all their linked accounts/files.
-- **URL:** `DELETE /api/admin/users/:id`
+### 9.5 Delete User Account
+Permanently deletes the user and all their linked accounts and file references.
+- **Route:** `DELETE /api/admin/users/:id`
 - **Response:** `{ "success": true }`
 
-### Get Global Settings
-- **URL:** `GET /api/admin/settings`
-- **Response:** `{ "registrationEnabled": true, "webRegistrationEnabled": true, ... }`
+### 9.6 Get Global Admin Settings
+- **Route:** `GET /api/admin/settings`
+- **Response:** Global configuration flags (`registrationEnabled`, `webRegistrationEnabled`, `botRegistrationEnabled`).
 
-### Update Global Setting
-- **URL:** `POST /api/admin/settings`
-- **Body:** (JSON)
+### 9.7 Update Global Admin Setting
+- **Route:** `POST /api/admin/settings`
+- **Request Body (JSON):**
   ```json
   {
     "key": "registrationEnabled",
@@ -307,11 +532,20 @@ Permanently deletes the user and all their linked accounts/files.
 
 ---
 
-## 7. OAuth Flows
+## 10. Android & Mobile Developer Quick Reference
 
-*(Note: These are mostly meant for browsers rather than native app integration, but included for completeness)*
-
-- **GET /api/auth/drive-link**: Returns the Google OAuth redirect URL.
-- **GET /api/auth/onedrive-link**: Returns the Microsoft OAuth redirect URL.
-- **GET /auth/google/callback**: Google OAuth callback.
-- **GET /auth/microsoft/callback**: Microsoft OAuth callback.
+| Feature | Endpoint | HTTP Method | Auth | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Login** | `/api/login` | POST | None | Returns Bearer `token` |
+| **List Drives** | `/api/accounts` | GET | Bearer | Returns all linked drives |
+| **Google OAuth** | `/api/auth/drive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
+| **OneDrive OAuth** | `/api/auth/onedrive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
+| **Add TG Drive** | `/api/tgdrive/register` | POST | Bearer | Pass `channelId` and `driveName` |
+| **List Files** | `/api/files` | GET | Bearer | Pass `accountId` & optional `folderId` |
+| **Create Folder** | `/api/folders` | POST | Bearer | Pass `name` & `parentId` |
+| **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` |
+| **Download/Stream** | `/api/download/:accId/:fileId`| GET | Bearer or `?token=` | Supports `Range` header and `?preview=1` |
+| **Move File** | `/api/files/move` | POST | Bearer | Supports same-drive & cross-drive transfers |
+| **Copy File** | `/api/files/copy` | POST | Bearer | Supports same-drive & cross-drive cloning |
+| **Share Link** | `/api/share` | POST | Bearer | Returns public URL `/s/:shareId` |
+| **Public Download**| `/api/public/download/:shareId`| GET | None | Direct file download |
