@@ -280,6 +280,53 @@ Links a private or public Telegram channel as an unlimited cloud storage drive.
 
 ---
 
+### 5.5 Telegram Drive Database & Virtual Filesystem Architecture
+
+Telegram channels natively store media as flat message streams without directories or folder structures. Cloudyte solves this by maintaining a **hybrid storage engine**:
+1. **Raw File Binaries:** Stored directly in the linked Telegram channel as message attachments (providing virtually unlimited, free cloud storage).
+2. **Virtual Filesystem in MongoDB:** All directories, folder hierarchies, custom file names, MIME types, and share IDs are indexed and managed in MongoDB collections:
+   - **`tg_files` collection:** Stores each file's metadata (`messageId`, `accountId`, `name`, `size`, `mimeType`, `folder`, `shareId`, `date`).
+   - **`tg_folders` collection:** Stores virtual directory paths (`accountId`, `name`, `path`, `createdAt`).
+
+#### Telegram Drive Database Schema:
+```typescript
+// tg_files Document
+interface TgFileDoc {
+  _id: ObjectId;          // Unique file ID (used in /api/files/:fileId and /api/download/:accId/:fileId)
+  userId?: string;        // Owner user ID
+  accountId: ObjectId;    // Linked tgdrive account _id
+  messageId: number;      // Telegram message ID in the channel
+  shareId: string;        // Public share code (for /s/:shareId)
+  name: string;           // File display name (e.g. "presentation.pdf")
+  size: number;           // File size in bytes
+  mimeType: string;       // Detected MIME type
+  folder: string;         // Virtual folder path (e.g. "" for root, "documents/work" for nested)
+  caption?: string;       // Optional Telegram message caption
+  date: number;           // Unix timestamp (seconds)
+}
+
+// tg_folders Document
+interface TgFolderDoc {
+  _id: ObjectId;
+  userId?: string;
+  accountId: ObjectId;    // Linked tgdrive account _id
+  name: string;           // Folder name (e.g. "work")
+  path: string;           // Full folder path (e.g. "documents/work")
+  createdAt: number;      // Unix timestamp (seconds)
+}
+```
+
+#### How Folder Paths Work in Telegram Drive:
+- **Root Directory:** Indicated by `""` (empty string) or `"root"`.
+- **Subdirectories:** Indicated by relative slash paths, e.g., `"photos"` or `"photos/2026"`.
+- **Folder IDs in `GET /api/files`:** Folders in Telegram Drive are returned with IDs prefixed as `folder:<path>` (for example, `folder:photos/2026`). When navigating into this folder, pass `folderId=photos/2026` or `folderId=folder:photos/2026` in subsequent API calls.
+- **Zero-Copy Instant Operations:** Because folder hierarchies and names live in the database:
+  - Renaming a file updates `name` in `tg_files` instantly without re-uploading to Telegram.
+  - Moving a file between folders updates `folder` in `tg_files` instantly without transferring data.
+  - Deleting a file checks if other cloned references share the same `messageId`; if it's the last reference, it revokes and deletes the Telegram channel message as well.
+
+---
+
 ## 6. File & Folder Operations
 
 ### 6.1 List Files and Folders
