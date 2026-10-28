@@ -21,6 +21,7 @@ export interface BotDeps {
   resolvePeer: (telegram: TelegramClient, id: string) => Promise<any>;
   driveCache: { get: (k: string) => any; set: (k: string, v: any, ttl?: number) => any };
   invalidateDriveCache: (accountId: string) => void;
+  deleteThumbFiles?: (fileId: string) => void;
   nanoid: (length?: number) => string;
   nanoid12: () => string;
   oauth2Client: any;
@@ -41,7 +42,7 @@ export function initBot(deps: BotDeps): Telegraf | null {
 
   const {
     connectToMongo, getUserIdByTg, getDriveClient, getOneDriveClient,
-    getTgClient, resolvePeer, driveCache, invalidateDriveCache,
+    getTgClient, resolvePeer, driveCache, invalidateDriveCache, deleteThumbFiles,
     nanoid, nanoid12, oauth2Client, MICROSOFT_CLIENT_ID, MICROSOFT_REDIRECT_URI,
   } = deps;
 
@@ -708,13 +709,13 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         }
 
         // ── UPLOAD PHASE with progress ────────────────────────────────────
-        const fileBuffer    = fs.readFileSync(tmpPath);
-        const totalBytes    = fileBuffer.length;
+        const stat          = fs.statSync(tmpPath);
+        const totalBytes    = stat.size;
         let   uploadedBytes = 0;
         let   lastUpd2      = 0;
 
-        const trackUpload = (chunk: Buffer) => {
-          uploadedBytes += chunk.length;
+        const trackUpload = (len: number) => {
+          uploadedBytes += len;
           const now = Date.now();
           if (now - lastUpd2 > 2000) {
             bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
@@ -734,35 +735,37 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
           const c          = await getOneDriveClient(account.tokens, accId!);
           const parentPath = folderId ? `/me/drive/items/${folderId}` : '/me/drive/root';
           // Use chunked upload if file is large (> 4MB)
-          if (fileBuffer.length > 4 * 1024 * 1024) {
+          if (totalBytes > 4 * 1024 * 1024) {
              const uploadSession = await c.api(`${parentPath}:/${encodeURIComponent(fileName)}:/createUploadSession`).post({
                item: { '@microsoft.graph.conflictBehavior': 'rename', name: fileName }
              });
-             const st = new stream.PassThrough();
-             st.end(fileBuffer);
-             const fileObj = {
-               name: fileName,
-               size: fileBuffer.length,
-               content: fileBuffer,
-               sliceFile: (range: any) => Promise.resolve(fileBuffer.slice(range.minValue, range.maxValue + 1))
-             };
-             const uploadTask = new LargeFileUploadTask(c, fileObj, uploadSession);
-             await (uploadTask as any).upload((range: any) => {
-               if (range) trackUpload(Buffer.alloc(range.maxValue - range.minValue + 1));
-             });
+             const uploadUrl  = uploadSession.uploadUrl;
+             const chunkSize  = 320 * 1024 * 10;
+             for (let start = 0; start < totalBytes; start += chunkSize) {
+               const end         = Math.min(start + chunkSize, totalBytes);
+               const chunkLen    = end - start;
+               const chunkStream = fs.createReadStream(tmpPath, { start, end: end - 1 });
+               await axios.put(uploadUrl, chunkStream, {
+                 headers: {
+                   'Content-Range': `bytes ${start}-${end - 1}/${totalBytes}`,
+                   'Content-Length': chunkLen,
+                 }
+               });
+               trackUpload(chunkLen);
+             }
           } else {
-             await c.api(`${parentPath}:/${encodeURIComponent(fileName)}:/content`).put(fileBuffer);
+             const streamUpload = fs.createReadStream(tmpPath);
+             await c.api(`${parentPath}:/${encodeURIComponent(fileName)}:/content`).put(streamUpload);
           }
         } else {
           const drive = await getDriveClient(account.tokens);
-          const pt    = new stream.PassThrough();
+          const readStream = fs.createReadStream(tmpPath);
           const tr    = new stream.Transform({
-            transform(chunk, _enc, cb) { trackUpload(chunk); cb(null, chunk); }
+            transform(chunk, _enc, cb) { trackUpload(chunk.length); cb(null, chunk); }
           });
-          pt.end(fileBuffer);
           await drive.files.create({
             requestBody: { name: fileName, parents: [folderId || 'root'] },
-            media:       { mimeType, body: pt.pipe(tr) }
+            media:       { mimeType, body: readStream.pipe(tr) }
           });
         }
 
@@ -786,26 +789,31 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
               });
             } else if (backupAcc.accountType === 'onedrive') {
               const c2 = await getOneDriveClient(backupAcc.tokens, backupAcc._id.toString());
-              if (fileBuffer.length > 4 * 1024 * 1024) {
+              if (totalBytes > 4 * 1024 * 1024) {
                 const uploadSession = await c2.api('/me/drive/root:/' + encodeURIComponent(fileName) + ':/createUploadSession').post({
                   item: { '@microsoft.graph.conflictBehavior': 'rename', name: fileName }
                 });
-                const st = new stream.PassThrough(); st.end(fileBuffer);
-                const fileObj2 = {
-                  name: fileName,
-                  size: fileBuffer.length,
-                  content: fileBuffer,
-                  sliceFile: (range: any) => Promise.resolve(fileBuffer.slice(range.minValue, range.maxValue + 1))
-                };
-                const uploadTask = new LargeFileUploadTask(c2, fileObj2, uploadSession);
-                await uploadTask.upload(); // We don't track backup progress to avoid confusing the user with multiple bars
+                const uploadUrl  = uploadSession.uploadUrl;
+                const chunkSize  = 320 * 1024 * 10;
+                for (let start = 0; start < totalBytes; start += chunkSize) {
+                  const end         = Math.min(start + chunkSize, totalBytes);
+                  const chunkLen    = end - start;
+                  const chunkStream = fs.createReadStream(tmpPath, { start, end: end - 1 });
+                  await axios.put(uploadUrl, chunkStream, {
+                    headers: {
+                      'Content-Range': `bytes ${start}-${end - 1}/${totalBytes}`,
+                      'Content-Length': chunkLen,
+                    }
+                  });
+                }
               } else {
-                await c2.api(`/me/drive/root:/${encodeURIComponent(fileName)}:/content`).put(fileBuffer);
+                const streamUpload2 = fs.createReadStream(tmpPath);
+                await c2.api(`/me/drive/root:/${encodeURIComponent(fileName)}:/content`).put(streamUpload2);
               }
             } else {
               const backupDrive = await getDriveClient(backupAcc.tokens);
-              const pt2 = new stream.PassThrough(); pt2.end(fileBuffer);
-              await backupDrive.files.create({ requestBody: { name: fileName }, media: { mimeType, body: pt2 } });
+              const readStream2 = fs.createReadStream(tmpPath);
+              await backupDrive.files.create({ requestBody: { name: fileName }, media: { mimeType, body: readStream2 } });
             }
           }
         } catch (backupErr) {
@@ -980,6 +988,7 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         } else {
           const drive = await getDriveClient(account.tokens); await drive.files.delete({ fileId: id });
         }
+        if (deleteThumbFiles) deleteThumbFiles(id);
         invalidateDriveCache(accId);
         ctx.answerCbQuery('✅ Deleted');
         ctx.editMessageText('🗑️ *File deleted.*', { parse_mode: 'Markdown' });

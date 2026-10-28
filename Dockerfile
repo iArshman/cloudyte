@@ -29,6 +29,11 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV THUMB_DIR=/app/data/thumbs
+
+# Create directory and declare volume for cached thumbnails
+RUN mkdir -p /app/data/thumbs
+VOLUME ["/app/data/thumbs"]
 
 # Copy package files
 COPY package*.json ./

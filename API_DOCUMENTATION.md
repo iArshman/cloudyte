@@ -39,7 +39,20 @@ Authorization: Basic <base64(admin_username:admin_password)>
 
 ## 3. Public & Auth Endpoints
 
-### 3.1 Get Public Settings
+> **Rate Limiting:** `/api/login` and `/api/register` are rate-limited to 10 requests per minute per IP address. Exceeding this limit returns HTTP `429 Too Many Requests` with `{ "error": "Too many requests, please try again later." }`.
+
+### 3.1 Health Check
+Liveness and uptime monitor.
+- **Method & Route:** `GET /healthz`
+- **Auth Required:** No
+- **Response (200 OK):**
+  ```json
+  {
+    "ok": true
+  }
+  ```
+
+### 3.2 Get Public Settings
 Returns the global registration policy.
 - **Method & Route:** `GET /api/public/settings`
 - **Auth Required:** No
@@ -52,8 +65,8 @@ Returns the global registration policy.
   }
   ```
 
-### 3.2 User Registration
-Register a new user account if public registration is enabled.
+### 3.3 User Registration
+Register a new user account if public registration is enabled. Subject to rate limits (10 req/min).
 - **Method & Route:** `POST /api/register`
 - **Auth Required:** No
 - **Request Body (JSON):**
@@ -69,10 +82,10 @@ Register a new user account if public registration is enabled.
     "success": true
   }
   ```
-- **Errors:** `400 Bad Request` (missing fields, username taken, registration disabled).
+- **Errors:** `400 Bad Request` (missing fields, username taken, registration disabled), `429 Too Many Requests`.
 
-### 3.3 User Login
-Authenticate with username and password to receive a persistent session token.
+### 3.4 User Login
+Authenticate with username and password to receive a persistent session token. Subject to rate limits (10 req/min).
 - **Method & Route:** `POST /api/login`
 - **Auth Required:** No
 - **Request Body (JSON):**
@@ -91,9 +104,9 @@ Authenticate with username and password to receive a persistent session token.
     "isAdmin": false
   }
   ```
-- **Errors:** `401 Unauthorized` (invalid credentials or deactivated account).
+- **Errors:** `401 Unauthorized` (invalid credentials or deactivated account), `429 Too Many Requests`.
 
-### 3.4 Logout
+### 3.5 Logout
 Terminates and invalidates the session token in the database.
 - **Method & Route:** `POST /api/logout`
 - **Auth Required:** Yes
@@ -337,32 +350,68 @@ Fetches files and subfolders within a specific account and directory.
   - `accountId` *(Required)*: ID of the storage account/drive.
   - `folderId` *(Optional)*: Folder ID to view (use `"root"` or omit for the root directory).
   - `search` *(Optional)*: Search keyword to filter items by name.
-- **Response (200 OK):**
+  - `limit` *(Optional)*: Pagination limit between 1 and 200 (default: `100`).
+  - `cursor` *(Optional, tgdrive only)*: Base64-encoded pagination cursor (`${date}:${_id}`).
+- **Caching & ETags:**
+  - Every account type includes a weak ETag header (`ETag: W/"<hash>"`).
+  - Sending `If-None-Match: W/"<hash>"` responds with `304 Not Modified` if data is unchanged.
+  - Drive and OneDrive listing queries are cached in a 60-second NodeCache, automatically invalidated upon upload, delete, rename, move, copy, or folder creation.
+- **Pagination Headers (tgdrive):**
+  - If additional files are available beyond `limit`, the response includes an `X-Next-Cursor` header with the cursor for the next page.
+  - Folders are only returned when no `cursor` is provided and no `search` is active.
+- **Response (200 OK):** Plain JSON array of normalized items:
   ```json
   [
     {
-      "id": "65d8a2a1e4b0...",
-      "name": "Photos",
+      "id": "folder:documents/work",
+      "name": "work",
       "type": "folder",
-      "size": "--",
-      "updatedAt": "2026-08-20T14:32:00.000Z",
-      "isShared": false
+      "size": "-",
+      "modified": "-",
+      "createdAt": "-",
+      "folder": "documents/work",
+      "isTgDrive": true,
+      "updatedAt": 1718000000000,
+      "thumbUrl": null
     },
     {
-      "id": "65d8a2b5e4b0...",
-      "name": "presentation.pdf",
-      "type": "pdf",
-      "size": "4.2 MB",
-      "rawSize": 4404019,
-      "updatedAt": "2026-08-22T09:15:00.000Z",
-      "mimeType": "application/pdf",
-      "isShared": false,
-      "shareId": null
+      "id": "65d8a2b5e4b0222222222222",
+      "name": "presentation.mp4",
+      "type": "video",
+      "size": "42.5 MB",
+      "sizeBytes": 44564480,
+      "modified": "10/27/2026",
+      "createdAt": "10/27/2026",
+      "mimeType": "video/mp4",
+      "folder": "",
+      "shareId": "a1b2c3",
+      "isTgDrive": true,
+      "updatedAt": 1729980000000,
+      "thumbUrl": "/api/thumb/65d8a1f2e4b0111111111111/65d8a2b5e4b0222222222222?s=256"
     }
   ]
   ```
 
-### 6.2 Create Folder
+### 6.2 Get File Thumbnail
+Generates or serves an optimized cover thumbnail for images and videos across Telegram Drive, Google Drive, and OneDrive.
+- **Method & Route:** `GET /api/thumb/:accountId/:fileId`
+- **Auth Required:** Yes (`Authorization: Bearer <session_token>` or `?token=<session_token>`)
+- **Query Parameters:**
+  - `s` *(Optional)*: Thumbnail dimension in pixels, clamped between 64 and 512 (default: `256`).
+- **Caching & Performance:**
+  - **Disk Cache:** Cached locally on disk (`${THUMB_DIR}/${fileId}_${s}.jpg`).
+  - **Concurrency:** Limited to 4 parallel image processing pipelines via `p-limit(4)` with deduplication for in-flight requests.
+  - **Response Headers:**
+    - On 200 OK: `Cache-Control: private, max-age=31536000, immutable`, `ETag: "${fileId}_${s}"`
+    - On 404: `Cache-Control: private, max-age=300`
+    - Returns `304 Not Modified` if `If-None-Match` matches.
+  - **Storage Management:** Directory capped at 500 MB; oldest thumbnails by mtime are pruned periodically.
+- **Provider Thumbnail Strategies:**
+  - *Telegram Drive:* Downloads the smallest thumbnail >= `s` px from media document thumbs / photo sizes. If none exists and file is an image under 10 MB, downloads and generates from media.
+  - *Google Drive:* Fetches Google's `thumbnailLink` and resizes via Sharp (`fit: cover`, `jpeg: 75`).
+  - *OneDrive:* Fetches Microsoft Graph item thumbnails (medium/large) and resizes via Sharp.
+
+### 6.3 Create Folder
 Creates a new directory in the selected drive.
 - **Method & Route:** `POST /api/folders?accountId=:accountId`
 - **Auth Required:** Yes
@@ -375,8 +424,8 @@ Creates a new directory in the selected drive.
   ```
 - **Response (200 OK):** `{ "success": true }`
 
-### 6.3 Upload File
-Uploads a file to a specific storage drive and destination folder.
+### 6.4 Upload File
+Uploads a file to a specific storage drive and destination folder using disk-streamed storage (supports files up to 2 GB with zero RAM buffering).
 - **Method & Route:** `POST /api/upload/:accountId`
 - **Auth Required:** Yes
 - **Content-Type:** `multipart/form-data`
@@ -390,15 +439,19 @@ Uploads a file to a specific storage drive and destination folder.
   }
   ```
 
-### 6.4 Download or Stream File
+### 6.5 Download or Stream File
 Streams or downloads a file from any linked drive (Telegram, Google Drive, OneDrive).
 - **Method & Route:** `GET /api/download/:accountId/:fileId`
 - **Auth Required:** Yes (`Authorization` header or `?token=<session_token>`)
 - **Query Parameters:**
-  - `preview=1` *(Optional)*: Sets `Content-Disposition: inline` instead of `attachment`, enabling in-app preview for images, PDFs, and video playback.
-- **HTTP Range Support:** Full support for `Range: bytes=start-end` and `206 Partial Content` (for video seek and streaming).
+  - `preview=1` *(Optional)*: Sets `Content-Disposition: inline` instead of `attachment`, enabling in-app preview for images, PDFs, and video playback. Sends `Cache-Control: private, max-age=86400`.
+- **Headers & Streaming:**
+  - Always sends `Accept-Ranges: bytes`.
+  - Content-Disposition uses RFC 5987 standard: `filename*=UTF-8''<encoded_name>`.
+  - For Telegram Drive: builds ETag `"${meta._id}-${meta.size}"` and returns `304 Not Modified` before contacting Telegram if `If-None-Match` matches.
+  - Automatically aborts downloads on client disconnect (`res.on('close')`) and respects stream backpressure (`drain`).
 
-### 6.5 Rename File
+### 6.6 Rename File
 Renames an existing file or folder.
 - **Method & Route:** `PATCH /api/files/:fileId?accountId=:accountId`
 - **Auth Required:** Yes
@@ -410,8 +463,8 @@ Renames an existing file or folder.
   ```
 - **Response (200 OK):** `{ "success": true }`
 
-### 6.6 Delete File
-Permanently removes a file or folder.
+### 6.7 Delete File
+Permanently removes a file or folder and purges any associated cached thumbnails.
 - **Method & Route:** `DELETE /api/files/:fileId?accountId=:accountId`
 - **Auth Required:** Yes
 - **Response (200 OK):** `{ "success": true }`
@@ -583,15 +636,18 @@ Permanently deletes the user and all their linked accounts and file references.
 
 | Feature | Endpoint | HTTP Method | Auth | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| **Login** | `/api/login` | POST | None | Returns Bearer `token` |
+| **Health Check** | `/healthz` | GET | None | Liveness check returns `{ "ok": true }` |
+| **Login** | `/api/login` | POST | None | Rate limited (10/min); returns Bearer `token` |
+| **Register** | `/api/register` | POST | None | Rate limited (10/min) |
 | **List Drives** | `/api/accounts` | GET | Bearer | Returns all linked drives |
 | **Google OAuth** | `/api/auth/drive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **OneDrive OAuth** | `/api/auth/onedrive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **Add TG Drive** | `/api/tgdrive/register` | POST | Bearer | Pass `channelId` and `driveName` |
-| **List Files** | `/api/files` | GET | Bearer | Pass `accountId` & optional `folderId` |
+| **List Files** | `/api/files` | GET | Bearer | Supports `cursor`, `limit`, weak ETag 304, returns `updatedAt` & `thumbUrl` |
+| **Thumbnail** | `/api/thumb/:accId/:fileId` | GET | Bearer or `?token=` | Optimized image/video thumbnail, `?s=256` |
 | **Create Folder** | `/api/folders` | POST | Bearer | Pass `name` & `parentId` |
-| **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` |
-| **Download/Stream** | `/api/download/:accId/:fileId`| GET | Bearer or `?token=` | Supports `Range` header and `?preview=1` |
+| **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` (disk-streamed up to 2GB) |
+| **Download/Stream** | `/api/download/:accId/:fileId`| GET | Bearer or `?token=` | Supports `Range`, RFC 5987, ETag 304, and `?preview=1` |
 | **Move File** | `/api/files/move` | POST | Bearer | Supports same-drive & cross-drive transfers |
 | **Copy File** | `/api/files/copy` | POST | Bearer | Supports same-drive & cross-drive cloning |
 | **Share Link** | `/api/share` | POST | Bearer | Returns public URL `/s/:shareId` |
