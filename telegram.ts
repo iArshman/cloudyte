@@ -662,6 +662,7 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         caption,
         date:      Math.floor(Date.now() / 1000),
       });
+        invalidateDriveCache(accId);
         await bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `✅ *Saved to TG Drive!*\n\n📄 \`${fileName}\`\n📏 \`${sizeMB} MB\`\n📁 \`${folderId || 'Root'}\``, { parse_mode: 'Markdown' }).catch(() => {});
         return;
       }

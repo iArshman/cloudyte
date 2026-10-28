@@ -209,7 +209,47 @@ Fetches all drives connected to the current user (Google Drive, OneDrive, Telegr
   ]
   ```
 
-### 5.2 Delete / Unlink Account
+### 5.2 Get Storage Summary & Category Breakdown
+Returns storage usage, quota, file count, and per-category byte breakdown for a specific linked account.
+- **Method & Route:** `GET /api/storage/summary?accountId=<id>`
+- **Auth Required:** Yes
+- **Query Parameters:**
+  - `accountId` *(Required)*: The ID of the linked storage account.
+- **Caching:**
+  - Responses are cached in `NodeCache` for 60 seconds per account and automatically invalidated on file upload, delete, move, and copy.
+  - For Google Drive and OneDrive, reuses the 5-minute cached quota fields (`quotaUsage`, `quotaLimit`, `quotaCachedAt`) from `/api/accounts` so the upstream provider is not queried on every request.
+- **Response (200 OK — Telegram Drive `tgdrive`):**
+  Aggregates `tg_files` with a single MongoDB `$group` stage on `size` bucketed by MIME type and file extension (`image/*`, `video/*`, `audio/*`, pdf/doc/xls/ppt/text types, zip/rar/7z/tar/gz, and everything else):
+  ```json
+  {
+    "accountId": "65d8a1f2e4b0111111111111",
+    "accountType": "tgdrive",
+    "usedBytes": 2576980377,
+    "totalBytes": null,
+    "fileCount": 42,
+    "categories": {
+      "images": 524288000,
+      "videos": 1572864000,
+      "audio": 104857600,
+      "documents": 262144000,
+      "archives": 83886080,
+      "other": 28940697
+    }
+  }
+  ```
+- **Response (200 OK — Google Drive `google` / OneDrive `onedrive`):**
+  ```json
+  {
+    "accountId": "65d8a1f2e4b0222222222222",
+    "accountType": "google",
+    "usedBytes": 12025908428,
+    "totalBytes": 16106127360,
+    "fileCount": null,
+    "categories": null
+  }
+  ```
+
+### 5.3 Delete / Unlink Account
 Disconnects a storage provider from the user's account.
 - **Method & Route:** `DELETE /api/accounts/:id`
 - **Auth Required:** Yes
@@ -359,7 +399,7 @@ Fetches files and subfolders within a specific account and directory.
 - **Pagination Headers (tgdrive):**
   - If additional files are available beyond `limit`, the response includes an `X-Next-Cursor` header with the cursor for the next page.
   - Folders are only returned when no `cursor` is provided and no `search` is active.
-- **Response (200 OK):** Plain JSON array of normalized items:
+- **Response (200 OK):** Plain JSON array of normalized items (every item includes formatted `size` and numeric `sizeBytes`):
   ```json
   [
     {
@@ -367,6 +407,7 @@ Fetches files and subfolders within a specific account and directory.
       "name": "work",
       "type": "folder",
       "size": "-",
+      "sizeBytes": 0,
       "modified": "-",
       "createdAt": "-",
       "folder": "documents/work",
@@ -640,10 +681,11 @@ Permanently deletes the user and all their linked accounts and file references.
 | **Login** | `/api/login` | POST | None | Rate limited (10/min); returns Bearer `token` |
 | **Register** | `/api/register` | POST | None | Rate limited (10/min) |
 | **List Drives** | `/api/accounts` | GET | Bearer | Returns all linked drives |
+| **Storage Summary** | `/api/storage/summary` | GET | Bearer | Pass `?accountId=<id>`; returns `usedBytes`, `totalBytes`, `fileCount`, `categories` |
 | **Google OAuth** | `/api/auth/drive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **OneDrive OAuth** | `/api/auth/onedrive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **Add TG Drive** | `/api/tgdrive/register` | POST | Bearer | Pass `channelId` and `driveName` |
-| **List Files** | `/api/files` | GET | Bearer | Supports `cursor`, `limit`, weak ETag 304, returns `updatedAt` & `thumbUrl` |
+| **List Files** | `/api/files` | GET | Bearer | Supports `cursor`, `limit`, weak ETag 304, returns `sizeBytes`, `updatedAt` & `thumbUrl` |
 | **Thumbnail** | `/api/thumb/:accId/:fileId` | GET | Bearer or `?token=` | Optimized image/video thumbnail, `?s=256` |
 | **Create Folder** | `/api/folders` | POST | Bearer | Pass `name` & `parentId` |
 | **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` (disk-streamed up to 2GB) |

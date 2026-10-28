@@ -561,7 +561,7 @@ function normaliseTgFile(f: any, accountId?: string) {
     type,
     mimeType:   f.mimeType,
     size:       f.size ? (Number(f.size) / (1024 ** 2)).toFixed(1) + ' MB' : '-',
-    sizeBytes:  f.size,
+    sizeBytes:  f.size ? Number(f.size) : 0,
     modified:   f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
     createdAt:  f.date ? new Date(f.date * 1000).toLocaleDateString() : '-',
     folder:     f.folder || '',
@@ -995,6 +995,34 @@ app.get('/api/me', requireAuth, async (req: any, res: any) => {
   });
 });
 
+async function getAccountQuota(acc: any, database: any): Promise<{ quotaUsage: string; quotaLimit: string; displayName: string }> {
+  const CACHE_TTL = 300000;
+  const now       = Date.now();
+  if (acc.quotaCachedAt && (now - new Date(acc.quotaCachedAt).getTime()) < CACHE_TTL && acc.quotaUsage !== undefined && acc.quotaLimit !== undefined) {
+    return {
+      quotaUsage:  String(acc.quotaUsage),
+      quotaLimit:  String(acc.quotaLimit),
+      displayName: acc.name,
+    };
+  }
+  let quotaUsage = '0', quotaLimit = '1', displayName = acc.name;
+  if (acc.accountType === 'onedrive') {
+    const c = await getOneDriveClient(acc.tokens || acc.credentials, acc._id.toString());
+    const d = await c.api('/me/drive').get();
+    quotaUsage = String(d.quota.used || 0);
+    quotaLimit = String(d.quota.total || 1);
+    displayName = acc.name || 'OneDrive';
+  } else {
+    const drive  = await getDriveClient(acc.tokens || acc.credentials);
+    const about  = await drive.about.get({ fields: 'storageQuota,user' });
+    quotaUsage   = String(about.data.storageQuota?.usage || '0');
+    quotaLimit   = String(about.data.storageQuota?.limit || '1');
+    displayName  = about.data.user?.displayName || acc.name;
+  }
+  await database.collection('accounts').updateOne({ _id: acc._id }, { $set: { quotaUsage, quotaLimit, quotaCachedAt: new Date(), name: displayName } });
+  return { quotaUsage, quotaLimit, displayName };
+}
+
 // ─── /api/accounts ────────────────────────────────────────────────────────────
 app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
   const database = req.db;
@@ -1045,30 +1073,153 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
     }
 
     try {
-      const CACHE_TTL = 300000;
-      const now       = Date.now();
-      if (acc.quotaCachedAt && (now - new Date(acc.quotaCachedAt).getTime()) < CACHE_TTL) {
-        return { id: acc._id.toString(), name: acc.name, email: acc.email, usage: (Number(acc.quotaUsage) / (1024 ** 3)).toFixed(1) + ' GB', total: (Number(acc.quotaLimit) / (1024 ** 3)).toFixed(0) + ' GB', percentage: Math.round((Number(acc.quotaUsage) / Number(acc.quotaLimit)) * 100), accountType: acc.accountType || 'google' };
-      }
-      let quotaUsage = '0', quotaLimit = '1', displayName = acc.name;
-      if (acc.accountType === 'onedrive') {
-        const c = await getOneDriveClient(acc.tokens, acc._id.toString());
-        const d = await c.api('/me/drive').get();
-        quotaUsage = d.quota.used; quotaLimit = d.quota.total; displayName = acc.name || 'OneDrive';
-      } else {
-        const drive  = await getDriveClient(acc.tokens);
-        const about  = await drive.about.get({ fields: 'storageQuota,user' });
-        quotaUsage   = about.data.storageQuota?.usage || '0';
-        quotaLimit   = about.data.storageQuota?.limit || '1';
-        displayName  = about.data.user?.displayName || acc.name;
-      }
-      await database.collection('accounts').updateOne({ _id: acc._id }, { $set: { quotaUsage, quotaLimit, quotaCachedAt: new Date(), name: displayName } });
+      const { quotaUsage, quotaLimit, displayName } = await getAccountQuota(acc, database);
       return { id: acc._id.toString(), name: displayName, email: acc.email, usage: (Number(quotaUsage) / (1024 ** 3)).toFixed(1) + ' GB', total: (Number(quotaLimit) / (1024 ** 3)).toFixed(0) + ' GB', percentage: Math.round((Number(quotaUsage) / Number(quotaLimit)) * 100), accountType: acc.accountType || 'google' };
     } catch {
       return { id: acc._id.toString(), name: acc.name || 'Disconnected', email: acc.email || acc.channelId, error: true, percentage: 0, accountType: acc.accountType || 'google' };
     }
   }));
   res.json(enriched);
+});
+
+// ─── /api/storage/summary ─────────────────────────────────────────────────────
+app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.query;
+  const userId        = req.userId;
+  const database      = req.db;
+
+  if (!accountId || typeof accountId !== 'string') {
+    return res.status(400).json({ error: 'accountId is required' });
+  }
+
+  let accObjId: ObjectId;
+  try {
+    accObjId = new ObjectId(accountId);
+  } catch {
+    return res.status(400).json({ error: 'Invalid accountId' });
+  }
+
+  const query: any = { _id: accObjId };
+  if (!req.isAdmin && userId) query.userId = String(userId);
+  const account = await database.collection('accounts').findOne(query);
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  const cacheKey = `storage_summary:${accountId}`;
+  const cached = driveCache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    if (account.accountType === 'tgdrive') {
+      const sizeExpr = { $ifNull: ['$size', 0] };
+      const mimeExpr = { $ifNull: ['$mimeType', ''] };
+      const nameExpr = { $ifNull: ['$name', ''] };
+
+      const isImage = {
+        $or: [
+          { $regexMatch: { input: mimeExpr, regex: '^image/', options: 'i' } },
+          { $regexMatch: { input: nameExpr, regex: '\\.(jpe?g|png|gif|webp|bmp|svg|heic|ico|tiff?|avif)$', options: 'i' } },
+        ],
+      };
+      const isVideo = {
+        $and: [
+          { $not: [isImage] },
+          {
+            $or: [
+              { $regexMatch: { input: mimeExpr, regex: '^video/', options: 'i' } },
+              { $regexMatch: { input: nameExpr, regex: '\\.(mp4|mkv|mov|avi|webm|flv|wmv|m4v|3gp|mpe?g)$', options: 'i' } },
+            ],
+          },
+        ],
+      };
+      const isAudio = {
+        $and: [
+          { $not: [{ $or: [isImage, isVideo] }] },
+          {
+            $or: [
+              { $regexMatch: { input: mimeExpr, regex: '^audio/', options: 'i' } },
+              { $regexMatch: { input: nameExpr, regex: '\\.(mp3|wav|ogg|flac|aac|m4a|wma|opus)$', options: 'i' } },
+            ],
+          },
+        ],
+      };
+      const isArchive = {
+        $and: [
+          { $not: [{ $or: [isImage, isVideo, isAudio] }] },
+          {
+            $or: [
+              { $regexMatch: { input: mimeExpr, regex: '(zip|rar|7z|tar|gz|gzip|bzip|xz|compressed)', options: 'i' } },
+              { $regexMatch: { input: nameExpr, regex: '\\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst)$', options: 'i' } },
+            ],
+          },
+        ],
+      };
+      const isDocument = {
+        $and: [
+          { $not: [{ $or: [isImage, isVideo, isAudio, isArchive] }] },
+          {
+            $or: [
+              { $regexMatch: { input: mimeExpr, regex: '(pdf|msword|wordprocessingml|ms-excel|spreadsheetml|ms-powerpoint|presentationml|opendocument|^text/|rtf|csv|json|xml)', options: 'i' } },
+              { $regexMatch: { input: nameExpr, regex: '\\.(pdf|docx?|xlsx?|pptx?|txt|rtf|csv|md|odt|ods|odp)$', options: 'i' } },
+            ],
+          },
+        ],
+      };
+      const isOther = {
+        $not: [{ $or: [isImage, isVideo, isAudio, isArchive, isDocument] }],
+      };
+
+      const pipeline = [
+        { $match: { accountId: account._id } },
+        {
+          $group: {
+            _id:       null,
+            usedBytes: { $sum: sizeExpr },
+            fileCount: { $sum: 1 },
+            images:    { $sum: { $cond: [isImage, sizeExpr, 0] } },
+            videos:    { $sum: { $cond: [isVideo, sizeExpr, 0] } },
+            audio:     { $sum: { $cond: [isAudio, sizeExpr, 0] } },
+            documents: { $sum: { $cond: [isDocument, sizeExpr, 0] } },
+            archives:  { $sum: { $cond: [isArchive, sizeExpr, 0] } },
+            other:     { $sum: { $cond: [isOther, sizeExpr, 0] } },
+          },
+        },
+      ];
+
+      const [agg] = await database.collection('tg_files').aggregate(pipeline).toArray();
+      const summary = {
+        accountId:   account._id.toString(),
+        accountType: 'tgdrive' as const,
+        usedBytes:   agg?.usedBytes || 0,
+        totalBytes:  null,
+        fileCount:   agg?.fileCount || 0,
+        categories: {
+          images:    agg?.images || 0,
+          videos:    agg?.videos || 0,
+          audio:     agg?.audio || 0,
+          documents: agg?.documents || 0,
+          archives:  agg?.archives || 0,
+          other:     agg?.other || 0,
+        },
+      };
+      driveCache.set(cacheKey, summary, 60);
+      return res.json(summary);
+    }
+
+    const { quotaUsage, quotaLimit } = await getAccountQuota(account, database);
+    const summary = {
+      accountId:   account._id.toString(),
+      accountType: (account.accountType === 'onedrive' ? 'onedrive' : 'google') as 'google' | 'onedrive',
+      usedBytes:   Number(quotaUsage) || 0,
+      totalBytes:  Number(quotaLimit) || 0,
+      fileCount:   null,
+      categories:  null,
+    };
+    driveCache.set(cacheKey, summary, 60);
+    return res.json(summary);
+  } catch (err: any) {
+    console.error('Storage summary error:', err);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 app.delete('/api/accounts/:id', requireAuth, async (req: any, res: any) => {
@@ -1234,6 +1385,7 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
           name:      f.name,
           type:      'folder',
           size:      '-',
+          sizeBytes: 0,
           modified:  '-',
           createdAt: '-',
           folder:    f.path,
@@ -1295,6 +1447,7 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
         name: f.name,
         type,
         size: f.size ? (Number(f.size) / (1024 ** 2)).toFixed(1) + ' MB' : '-',
+        sizeBytes: f.size ? Number(f.size) : 0,
         modified: f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : '-',
         createdAt: f.createdTime ? new Date(f.createdTime).toLocaleDateString() : '-',
         webViewLink: f.webViewLink,
