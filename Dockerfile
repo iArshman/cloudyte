@@ -47,9 +47,7 @@ COPY --from=builder /app/dist ./dist
 # Copy backend files
 COPY server.ts telegram.ts ./
 
-# Optional config files
-COPY firebase-applet-config.json* ./
-COPY firebase-blueprint.json* ./
+
 
 EXPOSE 3000
 
