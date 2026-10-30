@@ -46,6 +46,12 @@ const AUTH_TOKEN     = Buffer.from(`${ADMIN_USERNAME}:${ADMIN_PASSWORD}`).toStri
 const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
 const MICROSOFT_CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET;
 const MICROSOFT_REDIRECT_URI = `${process.env.APP_URL}/auth/microsoft/callback`;
+const MEDIA_SIGNING_SECRET = process.env.MEDIA_SIGNING_SECRET || crypto.randomBytes(32).toString('hex');
+if (isProduction && !process.env.MEDIA_SIGNING_SECRET) {
+  throw new Error('MEDIA_SIGNING_SECRET is required in production');
+}
+const JOB_MAX_ATTEMPTS = Number(process.env.JOB_MAX_ATTEMPTS || 3);
+const JOB_LEASE_MS = 10 * 60 * 1000;
 
 const API_ID = Number(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
@@ -99,6 +105,21 @@ function getFreeBytes(dir = os.tmpdir()) {
 function hasTempDiskHeadroom(requiredBytes = 0) {
   const freeBytes = getFreeBytes();
   return freeBytes === null || freeBytes - requiredBytes >= MIN_TEMP_FREE_BYTES;
+}
+
+function signMediaRequest(accountId: string, fileId: string, expiresAt: number) {
+  return crypto.createHmac('sha256', MEDIA_SIGNING_SECRET)
+    .update(`${accountId}:${fileId}:${expiresAt}`)
+    .digest('base64url');
+}
+
+function isValidMediaRequest(accountId: string, fileId: string, expiresAt: string, signature: string) {
+  const expiry = Number(expiresAt);
+  if (!Number.isSafeInteger(expiry) || expiry < Date.now()) return false;
+  const expected = signMediaRequest(accountId, fileId, expiry);
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 const TEMP_FILE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
@@ -276,6 +297,9 @@ async function connectToMongo() {
     try { await db.collection('tg_files').createIndex({ shareId: 1 }, { unique: true, sparse: true }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ name: 'text' }); } catch { /* ignore */ }
     try { await db.collection('tg_folders').createIndex({ userId: 1 }); } catch { /* ignore */ }
+    try { await db.collection('jobs').createIndex({ status: 1, nextRunAt: 1, createdAt: 1 }); } catch { /* ignore */ }
+    try { await db.collection('jobs').createIndex({ userId: 1, createdAt: -1 }); } catch { /* ignore */ }
+    try { await db.collection('jobs').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
 
     await runMigration(db);
     await checkAdmin(db);
@@ -460,6 +484,15 @@ const requireAuth = async (req: any, res: any, next: any) => {
     }
   }
   res.status(401).json({ error: 'Unauthorized' });
+};
+
+const requireAuthOrSignedMedia = async (req: any, res: any, next: any) => {
+  const { exp, sig } = req.query;
+  if (typeof exp === 'string' && typeof sig === 'string' && isValidMediaRequest(req.params.accountId, req.params.fileId, exp, sig)) {
+    req.isSignedMedia = true;
+    return next();
+  }
+  return requireAuth(req, res, next);
 };
 
 // ─── GramJS singleton (bot-auth) ─────────────────────────────────────────────
@@ -787,9 +820,26 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
 
 // ─── Express app setup ────────────────────────────────────────────────────────
 export const app = express();
+app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean);
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Request-ID');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 // 1. DEPENDENCIES: Add compression before routes
 app.use(compression());
-app.use(express.json());
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 // Correlate client-visible failures with server logs without logging credentials.
 app.use((req: any, res, next) => {
   const startedAt = Date.now();
@@ -1772,8 +1822,21 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
   }
 });
 
+app.get('/api/media-link/:accountId/:fileId', requireAuth, async (req: any, res: any) => {
+  const { accountId, fileId } = req.params;
+  const database = req.db;
+  const query: any = { _id: new ObjectId(accountId) };
+  if (!req.isAdmin && req.userId) query.userId = String(req.userId);
+  const account = await database.collection('accounts').findOne(query);
+  if (!account) return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  const sig = signMediaRequest(accountId, fileId, expiresAt);
+  const baseUrl = (process.env.APP_URL || '').replace(/\/$/, '');
+  res.json({ url: `${baseUrl}/api/download/${encodeURIComponent(accountId)}/${encodeURIComponent(fileId)}?exp=${expiresAt}&sig=${encodeURIComponent(sig)}`, expiresAt });
+});
+
 // ─── 4. Download (authed) ─────────────────────────────────────────────────────
-app.get('/api/download/:accountId/:fileId', requireAuth, async (req: any, res: any) => {
+app.get('/api/download/:accountId/:fileId', requireAuthOrSignedMedia, async (req: any, res: any) => {
   const { accountId, fileId } = req.params;
   const userId                = req.userId;
   const database              = req.db;
@@ -1868,6 +1931,10 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
   const database = req.db;
 
   if (sourceAccountId !== targetAccountId) {
+    if (req.query.async === 'true' || req.query.async === '1') {
+      const job = await enqueueTransferJob(database, { sourceAccountId, fileId, targetAccountId, targetFolderId, userId: userId ? String(userId) : null, isAdmin: !!req.isAdmin, isMove: true });
+      return res.status(202).json({ success: true, async: true, jobId: String(job._id), status: job.status });
+    }
     try {
       await providerLimit(`transfer:${sourceAccountId}:${targetAccountId}`, 1)(() =>
         crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, true)
@@ -1935,6 +2002,10 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
   const database = req.db;
 
   if (sourceAccountId !== targetAccountId) {
+    if (req.query.async === 'true' || req.query.async === '1') {
+      const job = await enqueueTransferJob(database, { sourceAccountId, fileId, targetAccountId, targetFolderId, userId: userId ? String(userId) : null, isAdmin: !!req.isAdmin, isMove: false });
+      return res.status(202).json({ success: true, async: true, jobId: String(job._id), status: job.status });
+    }
     try {
       await providerLimit(`transfer:${sourceAccountId}:${targetAccountId}`, 1)(() =>
         crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, false)
@@ -2385,6 +2456,112 @@ async function crossAccountTransfer(
   }
 }
 
+async function enqueueTransferJob(database: any, payload: any) {
+  const now = new Date();
+  const job = {
+    _id: nanoid(32),
+    type: 'cross_account_transfer',
+    status: 'queued',
+    attempts: 0,
+    maxAttempts: JOB_MAX_ATTEMPTS,
+    payload,
+    createdAt: now,
+    updatedAt: now,
+    nextRunAt: now,
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+  };
+  await database.collection('jobs').insertOne(job);
+  return job;
+}
+
+function publicJob(job: any) {
+  return {
+    id: String(job._id),
+    type: job.type,
+    status: job.status,
+    attempts: job.attempts || 0,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+    error: job.error,
+  };
+}
+
+let jobWorkerRunning = false;
+async function runJobWorker() {
+  if (jobWorkerRunning || !db) return;
+  jobWorkerRunning = true;
+  try {
+    const now = new Date();
+    const claimedResult = await db.collection('jobs').findOneAndUpdate(
+      {
+        type: 'cross_account_transfer',
+        $or: [
+          { status: 'queued', nextRunAt: { $lte: now } },
+          { status: 'running', leaseUntil: { $lt: now } },
+        ],
+      },
+      {
+        $set: { status: 'running', startedAt: now, updatedAt: now, leaseUntil: new Date(Date.now() + JOB_LEASE_MS) },
+        $inc: { attempts: 1 },
+      },
+      { sort: { createdAt: 1 }, returnDocument: 'after' }
+    ) as any;
+    const job = claimedResult?.value ?? claimedResult;
+    if (!job) return;
+
+    try {
+      const p = job.payload;
+      await providerLimit(`transfer:${p.sourceAccountId}:${p.targetAccountId}`, 1)(() =>
+        crossAccountTransfer(p.sourceAccountId, p.fileId, p.targetAccountId, p.targetFolderId, p.userId, p.isAdmin, db, p.isMove)
+      );
+      invalidateDriveCache(p.sourceAccountId);
+      invalidateDriveCache(p.targetAccountId);
+      await db.collection('jobs').updateOne(
+        { _id: job._id, status: 'running' },
+        { $set: { status: 'completed', completedAt: new Date(), updatedAt: new Date() }, $unset: { leaseUntil: '' } }
+      );
+    } catch (err: any) {
+      const attempts = Number(job.attempts || 1);
+      const retry = attempts < Number(job.maxAttempts || JOB_MAX_ATTEMPTS);
+      await db.collection('jobs').updateOne(
+        { _id: job._id, status: 'running' },
+        retry
+          ? { $set: { status: 'queued', error: err.message || 'Transfer failed', nextRunAt: new Date(Date.now() + Math.min(60, 2 ** attempts) * 1000), updatedAt: new Date() }, $unset: { leaseUntil: '' } }
+          : { $set: { status: 'failed', error: err.message || 'Transfer failed', updatedAt: new Date() }, $unset: { leaseUntil: '' } }
+      );
+    }
+  } catch (err) {
+    console.error('[Jobs] Worker error:', err);
+  } finally {
+    jobWorkerRunning = false;
+  }
+}
+
+app.get('/api/jobs/:jobId', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const query: any = { _id: req.params.jobId };
+  if (!req.isAdmin && req.userId) query['payload.userId'] = String(req.userId);
+  const job = await database.collection('jobs').findOne(query);
+  if (!job) return apiError(res, 404, 'JOB_NOT_FOUND', 'Job not found', req.requestId);
+  res.json(publicJob(job));
+});
+
+app.post('/api/jobs/:jobId/retry', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const query: any = { _id: req.params.jobId, status: 'failed' };
+  if (!req.isAdmin && req.userId) query['payload.userId'] = String(req.userId);
+  const result = await database.collection('jobs').findOneAndUpdate(
+    query,
+    { $set: { status: 'queued', nextRunAt: new Date(), updatedAt: new Date() }, $unset: { error: '', leaseUntil: '' } },
+    { returnDocument: 'after' }
+  ) as any;
+  const job = result?.value ?? result;
+  if (!job) return apiError(res, 404, 'JOB_NOT_RETRYABLE', 'Job is not found or is not failed', req.requestId);
+  res.json(publicJob(job));
+});
+
 // ─── Telegram Bot Initialization ──────────────────────────────────────────────
 const bot = initBot({
   connectToMongo,
@@ -2473,6 +2650,8 @@ pruneThumbDir(THUMB_DIR);
 pruneTempFiles();
 setInterval(() => pruneThumbDir(THUMB_DIR), 3600000);
 setInterval(() => pruneTempFiles(), 3600000);
+runJobWorker();
+setInterval(() => runJobWorker(), 2000);
 server = app.listen(Number(PORT), '0.0.0.0', () => console.log(`Cloudyte running at http://localhost:${PORT}`));
 
 export default app;

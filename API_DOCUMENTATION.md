@@ -61,6 +61,8 @@ Deployment readiness monitor. Returns `200` only after MongoDB initialization ha
 
 All responses include an `X-Request-ID` header. Include that ID when reporting an error so the corresponding server log entry can be located.
 
+For large cross-account transfers, clients can opt into durable processing with `?async=true`. The server returns `202 Accepted` and a job ID; the job survives process restarts because it is stored in MongoDB.
+
 ### 3.2 Get Public Settings
 Returns the global registration policy.
 - **Method & Route:** `GET /api/public/settings`
@@ -311,7 +313,17 @@ Generates the Microsoft OneDrive OAuth consent URL for the authenticated user.
 4. **Refresh Accounts List in App:**
    - On returning to the app (e.g. `onResume` / Custom Tab closed), call `GET /api/accounts` to refresh the user's linked drives.
 
-#### 5.3.4 Direct Telegram OAuth Route (Optional)
+#### 5.3.4 Short-Lived Media Links
+Authenticated clients can request a signed media URL when a media component cannot attach an `Authorization` header:
+
+- **Method & Route:** `GET /api/media-link/:accountId/:fileId`
+- **Auth Required:** Yes
+- **Lifetime:** 10 minutes
+- **Response:** `{ "url": "...", "expiresAt": 1770000000000 }`
+
+The returned URL is bound to the exact account and file. The existing bearer-token download path remains supported for compatibility.
+
+#### 5.3.5 Direct Telegram OAuth Route (Optional)
 Used when initiating linking from Telegram Bot interactions:
 - **Route:** `GET /auth/link?tgId=<telegram_user_id>`
 
@@ -560,6 +572,7 @@ Moves a file or folder to a new directory within the same account, or transfers 
     "success": true
   }
   ```
+- For a cross-account transfer, add `?async=true` to receive `202 Accepted` with `{ "success": true, "async": true, "jobId": "...", "status": "queued" }`. Poll `GET /api/jobs/:jobId` for completion.
 - **Errors:**
   - `400 Bad Request` (invalid account or unsupported drive type)
   - `404 Not Found` (source file or account does not exist / does not belong to user)
@@ -602,8 +615,15 @@ Duplicates a file in the destination directory or clones it across different sto
     "success": true
   }
   ```
+- For a cross-account copy, add `?async=true` to receive `202 Accepted` with a durable job ID. Poll `GET /api/jobs/:jobId` for completion.
 
 ---
+
+### 7.3 Durable Job Status
+- **Method & Route:** `GET /api/jobs/:jobId`
+- **Auth Required:** Yes
+- **Response:** `{ "id": "...", "type": "cross_account_transfer", "status": "queued|running|completed|failed", "attempts": 1 }`
+- **Retry:** `POST /api/jobs/:jobId/retry` retries a failed job owned by the authenticated user.
 
 ## 8. Public Share Links
 
