@@ -35,8 +35,12 @@ const __dirname  = path.dirname(__filename);
 const PORT       = process.env.PORT || 3000;
 
 const SALT_ROUNDS = 10;
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password';
+const isProduction = process.env.NODE_ENV === 'production';
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || (isProduction ? '' : 'admin');
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (isProduction ? '' : 'password');
+if (isProduction && (!ADMIN_USERNAME || !ADMIN_PASSWORD || ADMIN_PASSWORD === 'password')) {
+  throw new Error('ADMIN_USERNAME and a non-default ADMIN_PASSWORD are required in production');
+}
 const AUTH_TOKEN     = Buffer.from(`${ADMIN_USERNAME}:${ADMIN_PASSWORD}`).toString('base64');
 
 const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
@@ -54,6 +58,67 @@ if (!fs.existsSync(THUMB_DIR)) {
 
 const thumbLimit = pLimit(4);
 const inFlightThumbs = new Map<string, Promise<string | null>>();
+const providerLimits = new Map<string, ReturnType<typeof pLimit>>();
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+const MIN_TEMP_FREE_BYTES = Number(process.env.MIN_TEMP_FREE_BYTES || 5 * 1024 * 1024 * 1024);
+
+function providerLimit(key: string, concurrency = 3) {
+  const normalizedKey = key || 'unknown';
+  let limiter = providerLimits.get(normalizedKey);
+  if (!limiter) {
+    limiter = pLimit(concurrency);
+    providerLimits.set(normalizedKey, limiter);
+  }
+  return limiter;
+}
+
+function apiError(res: any, status: number, code: string, message: string, requestId?: string) {
+  return res.status(status).json({ error: message, code, requestId });
+}
+
+function errorCode(status: number) {
+  if (status === 400) return 'BAD_REQUEST';
+  if (status === 401) return 'AUTH_REQUIRED';
+  if (status === 403) return 'FORBIDDEN';
+  if (status === 404) return 'NOT_FOUND';
+  if (status === 409) return 'CONFLICT';
+  if (status === 429) return 'RATE_LIMITED';
+  if (status === 507) return 'INSUFFICIENT_STORAGE';
+  return 'INTERNAL_ERROR';
+}
+
+function getFreeBytes(dir = os.tmpdir()) {
+  try {
+    const stat = fs.statfsSync(dir);
+    return Number(stat.bavail) * Number(stat.bsize);
+  } catch {
+    return null;
+  }
+}
+
+function hasTempDiskHeadroom(requiredBytes = 0) {
+  const freeBytes = getFreeBytes();
+  return freeBytes === null || freeBytes - requiredBytes >= MIN_TEMP_FREE_BYTES;
+}
+
+const TEMP_FILE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const TEMP_FILE_PREFIXES = ['upload_', 'transfer_'];
+
+function pruneTempFiles(dir = os.tmpdir()) {
+  const cutoff = Date.now() - TEMP_FILE_MAX_AGE_MS;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!TEMP_FILE_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+      const fullPath = path.join(dir, name);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.isFile() && stat.mtimeMs < cutoff) fs.unlinkSync(fullPath);
+      } catch { /* another request may have removed or be using the file */ }
+    }
+  } catch (err) {
+    console.error('[TempFiles] Cleanup error:', err);
+  }
+}
 
 function pruneThumbDir(dir: string, maxBytes = 500 * 1024 * 1024) {
   try {
@@ -110,7 +175,9 @@ const authCache  = new NodeCache({ stdTTL: 60, checkperiod: 120 }); // 60s cache
 function invalidateDriveCache(accountId: string) {
   if (!accountId) return;
   const keys = driveCache.keys();
-  const toDelete = keys.filter(k => k.includes(accountId));
+  // Cache keys are namespaced as ...:<accountId>:...; avoid broad substring matches.
+  const boundary = `:${accountId}:`;
+  const toDelete = keys.filter(k => k.includes(boundary) || k.endsWith(`:${accountId}`));
   if (toDelete.length > 0) driveCache.del(toDelete);
 }
 
@@ -173,7 +240,7 @@ const upload = multer({
       cb(null, `upload_${Date.now()}_${nanoid(6)}_${safeName}`);
     }
   }),
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GB
+  limits: { fileSize: MAX_UPLOAD_BYTES },
 });
 
 // ─── MongoDB ─────────────────────────────────────────────────────────────────
@@ -190,11 +257,15 @@ async function connectToMongo() {
     // Startup indexes (ignore if they already exist)
     try { await db.collection('sessions').createIndex({ token: 1 }, { unique: true }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ accountId: 1, folder: 1, date: -1 }); } catch { /* ignore */ }
+    try { await db.collection('tg_files').createIndex({ accountId: 1, folder: 1, date: -1, _id: -1 }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ accountId: 1, name: 1 }); } catch { /* ignore */ }
+    try { await db.collection('tg_files').createIndex({ accountId: 1, folder: 1, name: 1 }); } catch { /* ignore */ }
     try { await db.collection('tg_folders').createIndex({ accountId: 1, path: 1 }); } catch { /* ignore */ }
 
     // Additional collection indexes
     try { await db.collection('sessions').createIndex({ createdAt: 1 }, { expireAfterSeconds: 2592000 }); } catch { /* ignore */ }
+    try { await db.collection('oauth_states').createIndex({ stateHash: 1, provider: 1 }, { unique: true }); } catch { /* ignore */ }
+    try { await db.collection('oauth_states').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
     try { await db.collection('accounts').createIndex({ userId: 1 }); } catch { /* ignore */ }
     try { await db.collection('accounts').createIndex({ email: 1 }); } catch { /* ignore */ }
     try { await db.collection('users').createIndex({ username: 1 }, { unique: true, sparse: true }); } catch { /* ignore */ }
@@ -209,11 +280,40 @@ async function connectToMongo() {
     await runMigration(db);
     await checkAdmin(db);
     await ensureDefaultSettings(db);
+    await runIndexDiagnostics(db);
 
     return db;
   } catch (err) {
     console.error('MongoDB error:', err);
     throw err;
+  }
+}
+
+async function runIndexDiagnostics(database: any) {
+  if (process.env.MONGODB_INDEX_DIAGNOSTICS !== 'true') return;
+  const checks = [
+    { collection: 'tg_files', filter: { accountId: new ObjectId('000000000000000000000000'), folder: '' }, sort: { date: -1, _id: -1 } },
+    { collection: 'tg_files', filter: { accountId: new ObjectId('000000000000000000000000'), folder: '', name: /example/i }, sort: { name: 1 } },
+    { collection: 'tg_folders', filter: { accountId: new ObjectId('000000000000000000000000'), path: /^/ }, sort: { path: 1 } },
+  ];
+  for (const check of checks) {
+    try {
+      const explain = await database.collection(check.collection)
+        .find(check.filter)
+        .sort(check.sort)
+        .limit(1)
+        .explain('executionStats');
+      console.log(JSON.stringify({
+        event: 'mongodb_index_diagnostic',
+        collection: check.collection,
+        namespace: explain.queryPlanner?.namespace,
+        winningPlan: explain.queryPlanner?.winningPlan?.stage,
+        docsExamined: explain.executionStats?.totalDocsExamined,
+        keysExamined: explain.executionStats?.totalKeysExamined,
+      }));
+    } catch (err) {
+      console.error('[Mongo] Index diagnostic failed:', err);
+    }
   }
 }
 
@@ -447,31 +547,33 @@ async function tgUploadFile(
   accountId: string, channelId: string, filePath: string,
   fileName: string, mimeType: string, folder: string, caption = ''
 ) {
-  const database = db || await connectToMongo();
-  const stat = fs.statSync(filePath);
-  const telegram   = await getTgClient();
-  const peerEntity = await resolvePeer(telegram, channelId);
-  const result     = await telegram.sendFile(peerEntity, {
-    file: filePath,
-    caption,
-    forceDocument: true,
-    attributes: [new Api.DocumentAttributeFilename({ fileName })],
-  }) as any;
-  const messageId = result.id as number;
-  const shareId   = nanoid(6);
-  const record    = {
-    accountId: new ObjectId(accountId),
-    messageId,
-    shareId,
-    name:     fileName,
-    size:     stat.size,
-    mimeType,
-    folder,
-    caption,
-    date:     Math.floor(Date.now() / 1000),
-  };
-  await database.collection('tg_files').insertOne(record);
-  return record;
+  return providerLimit(`telegram:upload:${accountId}`, 2)(async () => {
+    const database = db || await connectToMongo();
+    const stat = fs.statSync(filePath);
+    const telegram   = await getTgClient();
+    const peerEntity = await resolvePeer(telegram, channelId);
+    const result     = await telegram.sendFile(peerEntity, {
+      file: filePath,
+      caption,
+      forceDocument: true,
+      attributes: [new Api.DocumentAttributeFilename({ fileName })],
+    }) as any;
+    const messageId = result.id as number;
+    const shareId   = nanoid(6);
+    const record    = {
+      accountId: new ObjectId(accountId),
+      messageId,
+      shareId,
+      name:     fileName,
+      size:     stat.size,
+      mimeType,
+      folder,
+      caption,
+      date:     Math.floor(Date.now() / 1000),
+    };
+    await database.collection('tg_files').insertOne(record);
+    return record;
+  });
 }
 
 // Stream a TG file to an HTTP response (supports Range headers for video/audio).
@@ -685,13 +787,36 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
 
 // ─── Express app setup ────────────────────────────────────────────────────────
 export const app = express();
-
 // 1. DEPENDENCIES: Add compression before routes
 app.use(compression());
 app.use(express.json());
-
-// 7. ROBUSTNESS: Healthz endpoint
+// Correlate client-visible failures with server logs without logging credentials.
+app.use((req: any, res, next) => {
+  const startedAt = Date.now();
+  const requestId = typeof req.headers['x-request-id'] === 'string'
+    ? req.headers['x-request-id'].slice(0, 128)
+    : crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+  res.once('finish', () => {
+    console.log(JSON.stringify({
+      event: 'http_request',
+      requestId,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      durationMs: Date.now() - startedAt,
+      userId: req.userId ? String(req.userId) : undefined,
+    }));
+  });
+  next();
+});
+// Liveness only checks that the process is running; readiness also requires MongoDB.
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
+app.get('/readyz', (_req, res) => {
+  if (!db) return res.status(503).json({ ok: false, error: 'Database not ready' });
+  res.json({ ok: true });
+});
 
 // 7. ROBUSTNESS: Rate limiter for login & register (10 requests/min per IP)
 const authLimiter = rateLimit({
@@ -702,8 +827,17 @@ const authLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' }
 });
 
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.UPLOAD_REQUESTS_PER_WINDOW || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Upload rate limit exceeded.', code: 'RATE_LIMITED' },
+});
+
 app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
+app.use('/api/upload', uploadLimiter);
 
 // ─── Auth routes ─────────────────────────────────────────────────────────────
 app.post('/api/register', async (req, res) => {
@@ -1580,7 +1714,12 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
   const userId        = req.userId;
   const database      = req.db;
 
-  if (!file) return res.status(400).json({ error: 'No file uploaded' });
+  if (!file) return apiError(res, 400, 'NO_FILE_UPLOADED', 'No file uploaded', req.requestId);
+
+  if (!hasTempDiskHeadroom(file.size)) {
+    try { fs.unlinkSync(file.path); } catch { /* cleanup is retried by the periodic janitor */ }
+    return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low for this upload', req.requestId);
+  }
 
   const query: any = { _id: new ObjectId(accountId) };
   if (!req.isAdmin && userId) query.userId = String(userId);
@@ -1589,41 +1728,43 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
     if (file.path && fs.existsSync(file.path)) {
       try { fs.unlinkSync(file.path); } catch { /* ignore */ }
     }
-    return res.status(404).json({ error: 'Account not found' });
+    return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
   }
 
   try {
-    if (account.accountType === 'tgdrive') {
-      const folder = (!folderId || folderId === 'root') ? '' : folderId;
-      await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder);
-    } else if (account.accountType === 'onedrive') {
-      const c          = await getOneDriveClient(account.tokens || account.credentials, accountId);
-      const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
-      const encodedName = encodeURIComponent(file.originalname);
-      if (file.size <= 4 * 1024 * 1024) {
-        const streamUpload = fs.createReadStream(file.path);
-        await c.api(`${parentPath}:/${encodedName}:/content`).put(streamUpload);
-      } else {
-        const uploadSession = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname } });
-        const uploadUrl  = uploadSession.uploadUrl;
-        const chunkSize  = 320 * 1024 * 10;
-        for (let start = 0; start < file.size; start += chunkSize) {
-          const end         = Math.min(start + chunkSize, file.size);
-          const chunkLen    = end - start;
-          const chunkStream = fs.createReadStream(file.path, { start, end: end - 1 });
-          await axios.put(uploadUrl, chunkStream, { headers: { 'Content-Range': `bytes ${start}-${end - 1}/${file.size}`, 'Content-Length': chunkLen } });
+    await providerLimit(`upload:${account.accountType}:${accountId}`, account.accountType === 'tgdrive' ? 2 : 3)(async () => {
+      if (account.accountType === 'tgdrive') {
+        const folder = (!folderId || folderId === 'root') ? '' : folderId;
+        await tgUploadFile(accountId, account.channelId, file.path, file.originalname, file.mimetype, folder);
+      } else if (account.accountType === 'onedrive') {
+        const c          = await getOneDriveClient(account.tokens || account.credentials, accountId);
+        const parentPath = (!folderId || folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${folderId}`;
+        const encodedName = encodeURIComponent(file.originalname);
+        if (file.size <= 4 * 1024 * 1024) {
+          const streamUpload = fs.createReadStream(file.path);
+          await c.api(`${parentPath}:/${encodedName}:/content`).put(streamUpload);
+        } else {
+          const uploadSession = await c.api(`${parentPath}:/${encodedName}:/createUploadSession`).post({ item: { '@microsoft.graph.conflictBehavior': 'replace', name: file.originalname } });
+          const uploadUrl  = uploadSession.uploadUrl;
+          const chunkSize  = 320 * 1024 * 10;
+          for (let start = 0; start < file.size; start += chunkSize) {
+            const end         = Math.min(start + chunkSize, file.size);
+            const chunkLen    = end - start;
+            const chunkStream = fs.createReadStream(file.path, { start, end: end - 1 });
+            await axios.put(uploadUrl, chunkStream, { headers: { 'Content-Range': `bytes ${start}-${end - 1}/${file.size}`, 'Content-Length': chunkLen } });
+          }
         }
+      } else {
+        const drive       = await getDriveClient(account.tokens || account.credentials);
+        const fileStream  = fs.createReadStream(file.path);
+        await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fileStream } });
       }
-    } else {
-      const drive       = await getDriveClient(account.tokens || account.credentials);
-      const fileStream  = fs.createReadStream(file.path);
-      await drive.files.create({ requestBody: { name: file.originalname, parents: [folderId || 'root'] }, media: { mimeType: file.mimetype, body: fileStream } });
-    }
+    });
     invalidateDriveCache(accountId);
     res.json({ success: true });
   } catch (err: any) {
     console.error('Upload error:', err);
-    res.status(500).json({ error: err.message });
+    apiError(res, 502, 'PROVIDER_UPLOAD_FAILED', 'Provider upload failed', req.requestId);
   } finally {
     if (file?.path && fs.existsSync(file.path)) {
       try { fs.unlinkSync(file.path); } catch { /* ignore */ }
@@ -1728,7 +1869,9 @@ app.post('/api/files/move', requireAuth, async (req: any, res: any) => {
 
   if (sourceAccountId !== targetAccountId) {
     try {
-      await crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, true);
+      await providerLimit(`transfer:${sourceAccountId}:${targetAccountId}`, 1)(() =>
+        crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, true)
+      );
       invalidateDriveCache(sourceAccountId);
       invalidateDriveCache(targetAccountId);
       return res.json({ success: true });
@@ -1793,7 +1936,9 @@ app.post('/api/files/copy', requireAuth, async (req: any, res: any) => {
 
   if (sourceAccountId !== targetAccountId) {
     try {
-      await crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, false);
+      await providerLimit(`transfer:${sourceAccountId}:${targetAccountId}`, 1)(() =>
+        crossAccountTransfer(sourceAccountId, fileId, targetAccountId, targetFolderId, userId, req.isAdmin, database, false)
+      );
       invalidateDriveCache(sourceAccountId);
       invalidateDriveCache(targetAccountId);
       return res.json({ success: true });
@@ -1984,10 +2129,36 @@ const baseUrl     = (process.env.APP_URL || '').replace(/\/$/, '');
 const redirectUri = `${baseUrl}/auth/google/callback`;
 const oauth2Client = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, redirectUri);
 
+async function createOAuthState(database: any, userId: string, provider: 'google' | 'microsoft') {
+  const state = crypto.randomBytes(32).toString('base64url');
+  const stateHash = crypto.createHash('sha256').update(state).digest('hex');
+  await database.collection('oauth_states').insertOne({
+    stateHash,
+    userId: String(userId),
+    provider,
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+  });
+  return state;
+}
+
+async function consumeOAuthState(database: any, state: string, provider: 'google' | 'microsoft') {
+  if (!state) return null;
+  const stateHash = crypto.createHash('sha256').update(state).digest('hex');
+  const result = await database.collection('oauth_states').findOneAndDelete({
+    stateHash,
+    provider,
+    expiresAt: { $gt: new Date() },
+  }) as any;
+  return result?.value ?? result ?? null;
+}
+
 app.get('/api/auth/drive-link', requireAuth, async (req: any, res: any) => {
-  const token = req.headers.authorization?.split(' ')[1] || req.query.token;
-  if (!token) return res.status(401).json({ error: 'Auth token missing' });
-  const url = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile'], state: token, prompt: 'consent' });
+  const database = req.db || db || await connectToMongo();
+  const userId = req.isAdmin && !req.userId ? 'admin' : String(req.userId || '');
+  if (!userId) return res.status(401).json({ error: 'Authenticated user missing' });
+  const state = await createOAuthState(database, userId, 'google');
+  const url = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile'], state, prompt: 'consent' });
   res.json({ url });
 });
 
@@ -2001,13 +2172,20 @@ app.get('/auth/google/callback', async (req, res) => {
   const { code, state } = req.query;
   const database        = db || await connectToMongo();
   try {
-    const { tokens } = await oauth2Client.getToken(code as string);
+    if (!code || typeof state !== 'string') return res.status(400).send('Invalid OAuth callback.');
     let userId: string | null = null;
-    const stateStr = state as string;
-    if (stateStr === AUTH_TOKEN) { userId = 'admin'; }
-    else if (stateStr.startsWith('{')) { try { const p = JSON.parse(stateStr); userId = p.userId ? String(p.userId) : null; } catch { /* ignore */ } }
-    else { const session = await database.collection('sessions').findOne({ token: stateStr }); if (session) userId = String(session.userId); }
-    if (!userId) return res.status(401).send('Session lost. Please try again.');
+    if (state.startsWith('{')) {
+      try {
+        const p = JSON.parse(state);
+        if (p.tgId) userId = String(await getUserIdByTg(p.tgId, database) || '');
+        if (p.userId) userId = String(p.userId);
+      } catch { /* invalid legacy bot state */ }
+    } else {
+      const oauthState = await consumeOAuthState(database, state, 'google');
+      userId = oauthState?.userId ? String(oauthState.userId) : null;
+    }
+    if (!userId) return res.status(401).send('OAuth session expired. Please try again.');
+    const { tokens } = await oauth2Client.getToken(code as string);
     const authClient = new google.auth.OAuth2(); authClient.setCredentials(tokens);
     const about = await google.drive({ version: 'v3', auth: authClient }).about.get({ fields: 'user' });
     const ui    = about.data.user;
@@ -2023,25 +2201,33 @@ app.get('/auth/google/callback', async (req, res) => {
 });
 
 app.get('/api/auth/onedrive-link', requireAuth, async (req: any, res: any) => {
-  const token = req.headers.authorization?.split(' ')[1] || req.query.token;
-  if (!token) return res.status(401).json({ error: 'Auth token missing' });
-  const url = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=${MICROSOFT_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(MICROSOFT_REDIRECT_URI)}&response_mode=query&scope=${encodeURIComponent('files.readwrite.all User.Read offline_access')}&state=${encodeURIComponent(token)}&prompt=select_account`;
+  const database = req.db || db || await connectToMongo();
+  const userId = req.isAdmin && !req.userId ? 'admin' : String(req.userId || '');
+  if (!userId) return res.status(401).json({ error: 'Authenticated user missing' });
+  const state = await createOAuthState(database, userId, 'microsoft');
+  const url = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=${MICROSOFT_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(MICROSOFT_REDIRECT_URI)}&response_mode=query&scope=${encodeURIComponent('files.readwrite.all User.Read offline_access')}&state=${encodeURIComponent(state)}&prompt=select_account`;
   res.json({ url });
 });
-
 app.get('/auth/microsoft/callback', async (req, res) => {
   const { code, state } = req.query;
   const database        = db || await connectToMongo();
   try {
+    if (!code || typeof state !== 'string') return res.status(400).send('Invalid OAuth callback.');
+    let userId: string | null = null;
+    if (state.startsWith('{')) {
+      try {
+        const p = JSON.parse(state);
+        if (p.tgId) userId = String(await getUserIdByTg(p.tgId, database) || '');
+        if (p.userId) userId = String(p.userId);
+      } catch { /* invalid legacy bot state */ }
+    } else {
+      const oauthState = await consumeOAuthState(database, state, 'microsoft');
+      userId = oauthState?.userId ? String(oauthState.userId) : null;
+    }
+    if (!userId) return res.status(401).send('OAuth session expired. Please try again.');
     const r        = await axios.post('https://login.microsoftonline.com/common/oauth2/v2.0/token', new URLSearchParams({ client_id: MICROSOFT_CLIENT_ID!, client_secret: MICROSOFT_CLIENT_SECRET!, code: code as string, redirect_uri: MICROSOFT_REDIRECT_URI, grant_type: 'authorization_code' }));
     const rawTokens = r.data;
     const tokens    = { ...rawTokens, expiry_date: Date.now() + Number(rawTokens.expires_in || 3600) * 1000 };
-    let userId: string | null = null;
-    const stateStr  = state as string;
-    if (stateStr === AUTH_TOKEN) { userId = 'admin'; }
-    else if (stateStr.startsWith('{')) { try { const p = JSON.parse(stateStr); userId = p.userId ? String(p.userId) : null; } catch { /* ignore */ } }
-    else { const session = await database.collection('sessions').findOne({ token: stateStr }); if (session) userId = String(session.userId); }
-    if (!userId) return res.status(401).send('Session lost. Please try again.');
     const msc  = Client.init({ authProvider: (done) => done(null, tokens.access_token) });
     const user = await msc.api('/me').get();
     if (userId && database && user) {
@@ -2233,12 +2419,13 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // ─── 7. ROBUSTNESS: Final Express Error Handler ───────────────────────────────
-app.use((err: any, _req: any, res: any, next: any) => {
-  console.error('[Express] Unhandled error:', err);
+app.use((err: any, req: any, res: any, next: any) => {
+  console.error(`[Express] Unhandled error [${req.requestId || 'unknown'}]:`, err);
   if (res.headersSent) {
     return next(err);
   }
-  res.status(err.status || 500).json({ error: err.message || 'Internal Server Error' });
+  const status = Number(err.status) || 500;
+  apiError(res, status, err.code || errorCode(status), err.message || 'Internal Server Error', req.requestId);
 });
 
 // ─── 7. ROBUSTNESS: Process Unhandled Listeners ────────────────────────────────
@@ -2283,8 +2470,9 @@ try {
   console.error('[Startup] Initial MongoDB connection failed:', err);
 }
 pruneThumbDir(THUMB_DIR);
+pruneTempFiles();
 setInterval(() => pruneThumbDir(THUMB_DIR), 3600000);
-
+setInterval(() => pruneTempFiles(), 3600000);
 server = app.listen(Number(PORT), '0.0.0.0', () => console.log(`Cloudyte running at http://localhost:${PORT}`));
 
 export default app;

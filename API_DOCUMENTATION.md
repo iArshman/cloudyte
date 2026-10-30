@@ -39,7 +39,9 @@ Authorization: Basic <base64(admin_username:admin_password)>
 
 ## 3. Public & Auth Endpoints
 
-> **Rate Limiting:** `/api/login` and `/api/register` are rate-limited to 10 requests per minute per IP address. Exceeding this limit returns HTTP `429 Too Many Requests` with `{ "error": "Too many requests, please try again later." }`.
+> **Rate Limiting:** `/api/login` and `/api/register` are rate-limited to 10 requests per minute per IP address. Upload requests are limited to 30 per 15 minutes per IP by default and can be changed with `UPLOAD_REQUESTS_PER_WINDOW`. Exceeding a limit returns HTTP `429` with an `error` message and machine-readable `code: "RATE_LIMITED"`.
+
+New server-level, upload, and rate-limit errors retain the existing string `error` field for compatibility and also include a stable `code` and `requestId` where available. Uploads are rejected with `507 INSUFFICIENT_STORAGE` when the server temporary directory does not have the configured free-space reserve. Provider uploads and cross-account transfers are bounded by per-account concurrency limits to prevent upstream overload.
 
 ### 3.1 Health Check
 Liveness and uptime monitor.
@@ -51,6 +53,13 @@ Liveness and uptime monitor.
     "ok": true
   }
   ```
+
+### 3.1.1 Readiness Check
+Deployment readiness monitor. Returns `200` only after MongoDB initialization has completed; otherwise returns `503`.
+- **Method & Route:** `GET /readyz`
+- **Auth Required:** No
+
+All responses include an `X-Request-ID` header. Include that ID when reporting an error so the corresponding server log entry can be located.
 
 ### 3.2 Get Public Settings
 Returns the global registration policy.
@@ -267,7 +276,7 @@ When building an Android app or client that needs to link Google Drive or Micros
    - Google: `${APP_URL}/auth/google/callback`
    - Microsoft OneDrive: `${APP_URL}/auth/microsoft/callback` (or configured via `MICROSOFT_REDIRECT_URI`)
 2. **Session State Handshake:**
-   When the client requests an authorization URL, the server signs the OAuth `state` parameter with the user's active session token. When Google/Microsoft redirects back to the callback URL, the server verifies the `state`, attributes the tokens to the correct user ID in MongoDB, and completes the link.
+   When the client requests an authorization URL, the server creates a random, short-lived, one-time OAuth `state` record in MongoDB associated with the authenticated user and provider. The raw session token is not sent to Google or Microsoft. When the provider redirects back to the callback URL, the server consumes and validates the state record, attributes the tokens to the correct user ID, and completes the link.
 
 #### 5.3.1 Google Drive OAuth Linking Endpoint
 Generates the Google OAuth consent URL for the authenticated user.
@@ -276,7 +285,7 @@ Generates the Google OAuth consent URL for the authenticated user.
 - **Response (200 OK):**
   ```json
   {
-    "url": "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.profile&prompt=consent&response_type=code&client_id=...&redirect_uri=https%3A%2F%2Fyour-server.com%2Fauth%2Fgoogle%2Fcallback&state=<session_token>"
+    "url": "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&scope=...&prompt=consent&response_type=code&client_id=...&redirect_uri=https%3A%2F%2Fyour-server.com%2Fauth%2Fgoogle%2Fcallback&state=<one-time-state>"
   }
   ```
 
@@ -287,7 +296,7 @@ Generates the Microsoft OneDrive OAuth consent URL for the authenticated user.
 - **Response (200 OK):**
   ```json
   {
-    "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=...&response_type=code&redirect_uri=https%3A%2F%2Fyour-server.com%2Fauth%2Fmicrosoft%2Fcallback&response_mode=query&scope=files.readwrite.all+User.Read+offline_access&state=<session_token>&prompt=select_account"
+    "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=...&response_type=code&redirect_uri=https%3A%2F%2Fyour-server.com%2Fauth%2Fmicrosoft%2Fcallback&response_mode=query&scope=files.readwrite.all+User.Read+offline_access&state=<one-time-state>&prompt=select_account"
   }
   ```
 
