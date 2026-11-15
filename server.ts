@@ -23,7 +23,7 @@ import { google } from 'googleapis';
 import { Client, LargeFileUploadTask } from '@microsoft/microsoft-graph-client';
 import 'isomorphic-fetch';
 
-import { TelegramClient } from 'telegram';
+import { TelegramClient, helpers as tgHelpers } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { Api } from 'telegram/tl/index.js';
 import { createServer as createViteServer } from 'vite';
@@ -935,17 +935,16 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
         return;
       }
       const chunkSize = end - start + 1;
-      res.writeHead(206, {
-        'Content-Range':  `bytes ${start}-${end}/${totalSize}`,
-        'Accept-Ranges':  'bytes',
-        'Content-Length': chunkSize,
-        'Content-Type':   contentType,
-      });
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Length', chunkSize);
+      res.setHeader('Content-Type', contentType);
       const stepSize = 512 * 1024;
       let skipBytes = start % stepSize;
       const alignedStart = start - skipBytes;
       let downloaded = 0;
-      for await (const rawChunk of telegram.iterDownload({ file: media, requestSize: stepSize, offset: BigInt(alignedStart) as any })) {
+      for await (const rawChunk of telegram.iterDownload({ file: media, requestSize: stepSize, offset: tgHelpers.returnBigInt(alignedStart) })) {
         if (clientAborted || res.destroyed) break;
         let usableChunk = rawChunk;
         if (skipBytes > 0) {
@@ -986,6 +985,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
     if (!clientAborted) {
       console.error('tgStreamFile error:', err);
       if (!res.headersSent) res.status(500).send('Streaming error');
+      else if (!res.writableEnded) res.destroy(err);
     }
   } finally {
     res.off('close', onClose);
