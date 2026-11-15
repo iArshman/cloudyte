@@ -358,7 +358,12 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
       const msgId = opts.file.msgId;
       const item = telegramBlobs.get(msgId);
       if (!item) return;
-      const offset = Number(opts.offset || 0);
+      if (opts.offset !== undefined && typeof opts.offset?.divide !== 'function') {
+        throw new TypeError('offset.divide is not a function');
+      }
+      const offset = opts.offset !== undefined
+        ? (typeof opts.offset.toJSNumber === 'function' ? opts.offset.toJSNumber() : Number(opts.offset))
+        : 0;
       const slice = item.bytes.subarray(offset);
       const chunkSize = Number(opts.requestSize || 65536);
       for (let i = 0; i < slice.length; i += chunkSize) {
