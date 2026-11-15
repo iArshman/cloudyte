@@ -35,11 +35,45 @@ export async function withSessionLock<T>(sessionId: string, operation: () => Pro
 }
 
 export function chunkSha256(data: Uint8Array): string {
-  // Runtime-neutral deterministic FNV-1a digest for protocol bookkeeping; production callers
-  // should persist a cryptographic SHA-256 digest computed by node:crypto.
-  let hash = 2166136261;
-  for (const byte of data) hash = Math.imul(hash ^ byte, 16777619);
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+export function isSafeProviderItemId(id: unknown): id is string {
+  if (typeof id !== 'string') return false;
+  const trimmed = id.trim();
+  if (!trimmed || trimmed.length > 512) return false;
+  if (trimmed === '.' || trimmed === '..' || trimmed.includes('..')) return false;
+  if (/[\/\\\?#\s\x00-\x1f\x7f]/.test(trimmed)) return false;
+  return true;
+}
+
+export function escapeDriveQueryValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+export function isTrustedGraphNextLink(rawUrl: unknown): rawUrl is string {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'graph.microsoft.com';
+  } catch {
+    return false;
+  }
+}
+
+export function isValidHttpsUrl(rawUrl: unknown, allowLoopbackHttpInTest = false): rawUrl is string {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol === 'https:') return true;
+    if (allowLoopbackHttpInTest && process.env.CLOUDYTE_TEST_MODE === '1' && parsed.protocol === 'http:') {
+      const host = parsed.hostname.toLowerCase();
+      return host === '127.0.0.1' || host === 'localhost';
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 // ─── End-to-End Encryption (CYTE1) Validation & Privacy Helpers ───────────────
@@ -497,9 +531,11 @@ export function validateKeyBackupInput(rawBody: unknown): ValidationSuccess | Va
   };
 }
 
-export function computeFileSha256(filePath: string, fsModule: typeof import('fs') = fs): string {
+export async function computeFileSha256(filePath: string, fsModule: typeof import('fs') = fs): Promise<string> {
   const hash = crypto.createHash('sha256');
-  const data = fsModule.readFileSync(filePath);
-  hash.update(data);
+  const stream = fsModule.createReadStream(filePath, { highWaterMark: 256 * 1024 });
+  for await (const chunk of stream) {
+    hash.update(chunk);
+  }
   return hash.digest('hex');
 }
