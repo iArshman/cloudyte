@@ -13,6 +13,7 @@ import {
   validateUploadRequest,
   validateKeyBackupInput,
   validateOpaqueFilename,
+  computeFileSha256,
 } from './provider-transfer-protocol.ts';
 
 process.env.CLOUDYTE_TEST_MODE = '1';
@@ -174,6 +175,24 @@ class InMemoryCollection {
     this.docs.splice(idx, 1);
     return { deletedCount: 1 };
   }
+  async findOneAndDelete(query: any) {
+    const idx = this.docs.findIndex((d) => matchesQuery(d, query));
+    if (idx === -1) return null;
+    const [removed] = this.docs.splice(idx, 1);
+    return { ...removed };
+  }
+  async findOneAndUpdate(query: any, update: any, options?: { returnDocument?: string }) {
+    const idx = this.docs.findIndex((d) => matchesQuery(d, query));
+    if (idx === -1) return null;
+    const before = { ...this.docs[idx] };
+    const after = { ...this.docs[idx] };
+    if (update.$set) Object.assign(after, update.$set);
+    if (update.$inc) {
+      for (const [k, v] of Object.entries(update.$inc)) after[k] = Number(after[k] || 0) + Number(v);
+    }
+    this.docs[idx] = after;
+    return options?.returnDocument === 'after' ? after : before;
+  }
   async deleteMany(query: any) {
     const before = this.docs.length;
     this.docs = this.docs.filter((d) => !matchesQuery(d, query));
@@ -277,6 +296,19 @@ test('committed chunk replay is only accepted when offset, size, and SHA-256 mat
   assert.equal(isExactReplay(record, 0, Buffer.from('different')), false);
 });
 
+test('computeFileSha256 streams multi-chunk files without full memory buffering', async () => {
+  const tmpFile = path.join(os.tmpdir(), `cloudyte-sha-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`);
+  const payload = crypto.randomBytes(700 * 1024);
+  fs.writeFileSync(tmpFile, payload);
+  try {
+    const actual = await computeFileSha256(tmpFile, fs);
+    const expected = crypto.createHash('sha256').update(payload).digest('hex');
+    assert.equal(actual, expected);
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+});
+
 // ─── Full Backend E2EE Integration Suite (Tests 1..39) ───────────────────────
 test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
   const mockDb = new InMemoryDatabase();
@@ -344,6 +376,14 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
 
   const mockDriveFactory = async () => ({
     context: { _options: { auth: { getAccessToken: async () => 'gd_access_token' } } },
+    about: {
+      get: async () => ({
+        data: {
+          storageQuota: { usage: '1234', limit: '0' },
+          user: { emailAddress: 'alice@gmail.com' },
+        },
+      }),
+    },
     files: {
       create: async ({ requestBody, media }: any) => {
         const id = `gd_${++nextGoogleId}`;
@@ -467,6 +507,12 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
         return { id, name };
       },
       get: async () => {
+        if (apiPath === '/me/drive') {
+          return { quota: { used: 2048, total: 0 } };
+        }
+        if (apiPath === '/me/drive/root') {
+          return { id: 'od_root' };
+        }
         if (apiPath.endsWith('/children')) {
           return {
             value: Array.from(oneDriveBlobs.entries()).map(([id, item]) => ({
@@ -500,9 +546,27 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
       },
       patch: async (body: any) => {
         const m = apiPath.match(/\/me\/drive\/items\/([^/]+)$/);
-        if (m && oneDriveBlobs.has(m[1]) && body?.name) {
-          oneDriveBlobs.get(m[1])!.name = body.name;
+        if (m && oneDriveBlobs.has(m[1])) {
+          const item = oneDriveBlobs.get(m[1])!;
+          if (body?.name) item.name = body.name;
+          if (body?.parentReference?.id) item.parentId = body.parentReference.id;
         }
+      },
+      post: async (body: any) => {
+        const copyMatch = apiPath.match(/\/me\/drive\/items\/([^/]+)\/copy$/);
+        if (copyMatch) {
+          const orig = oneDriveBlobs.get(copyMatch[1]);
+          if (!orig) throw new Error('OneDrive source item not found');
+          const id = `od_${++nextOneDriveId}`;
+          oneDriveBlobs.set(id, {
+            bytes: Buffer.from(orig.bytes),
+            name: body?.name || orig.name,
+            mimeType: orig.mimeType,
+            parentId: body?.parentReference?.id || orig.parentId,
+          });
+          return { id };
+        }
+        return {};
       },
     }),
   });
@@ -1177,5 +1241,169 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     assert.equal(migrated.isEncrypted, false);
     assert.equal(migrated.encryptionFormatVersion, null);
     assert.equal(migrated.encryptedMetadata, null);
+  });
+
+  // ── 40. Security: NoSQL operator injection rejected on auth & login ──
+  await t.test('40. Rejects NoSQL operator injection in query token and login body', async () => {
+    const queryInjectRes = await fetch(`${baseUrl}/api/accounts?token[$ne]=invalid`);
+    assert.equal(queryInjectRes.status, 401);
+
+    const loginInjectRes = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: { $ne: '' }, password: { $ne: '' } }),
+    });
+    assert.equal(loginInjectRes.status, 400);
+  });
+
+  // ── 41. Security: OAuth account-takeover bypass and unauthenticated link blocked ──
+  await t.test('41. Blocks unauthenticated /auth/link and forged JSON state in OAuth callbacks', async () => {
+    const linkUnauth = await fetch(`${baseUrl}/auth/link?tgId=12345`);
+    assert.equal(linkUnauth.status, 401);
+
+    const forgedState = encodeURIComponent(JSON.stringify({ userId: user1Id }));
+    const gCb = await fetch(`${baseUrl}/auth/google/callback?code=fake&state=${forgedState}`);
+    assert.equal(gCb.status, 401);
+
+    const msCb = await fetch(`${baseUrl}/auth/microsoft/callback?code=fake&state=${forgedState}`);
+    assert.equal(msCb.status, 401);
+  });
+
+  // ── 42. Security: Thumbnail endpoint rejects path traversal ──
+  await t.test('42. Rejects path traversal fileId on /api/thumb', async () => {
+    const badThumb = await apiFetch(`/api/thumb/${tgAccount1Id}/..%2F..%2Fetc%2Fpasswd`);
+    assert.equal(badThumb.status, 400);
+  });
+
+  // ── 43. Android parity: POST /api/upload honors ?folderId, X-File-Checksum, and Idempotency-Key ──
+  await t.test('43. POST /api/upload honors folderId query param, X-File-Checksum header, and Idempotency-Key header', async () => {
+    const content = Buffer.from('Android header parity check payload');
+    const sha = crypto.createHash('sha256').update(content).digest('hex');
+
+    // Mismatched X-File-Checksum rejected with 422
+    const badForm = new FormData();
+    badForm.append('file', new Blob([content], { type: 'text/plain' }), 'bad-hdr.txt');
+    const badRes = await apiFetch(`/api/upload/${tgAccount1Id}?folderId=android_dir`, {
+      method: 'POST',
+      headers: { 'X-File-Checksum': '0'.repeat(64) },
+      body: badForm,
+    });
+    assert.equal(badRes.status, 422);
+
+    // Valid X-File-Checksum + Idempotency-Key + ?folderId=
+    const goodForm = new FormData();
+    goodForm.append('file', new Blob([content], { type: 'text/plain' }), 'hdr-ok.txt');
+    const okRes = await apiFetch(`/api/upload/${tgAccount1Id}?folderId=android_dir`, {
+      method: 'POST',
+      headers: {
+        'X-File-Checksum': sha,
+        'Idempotency-Key': 'android_idem_1',
+      },
+      body: goodForm,
+    });
+    assert.equal(okRes.status, 200);
+    const okJson: any = await okRes.json();
+    assert.equal(okJson.success, true);
+
+    const stored = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, idempotencyKey: 'android_idem_1' });
+    assert.ok(stored);
+    assert.equal(stored.folder, 'android_dir');
+
+    // Duplicate Idempotency-Key returns cached record without creating a second tg_files entry
+    const dupForm = new FormData();
+    dupForm.append('file', new Blob([content], { type: 'text/plain' }), 'hdr-ok.txt');
+    const dupRes = await apiFetch(`/api/upload/${tgAccount1Id}?folderId=android_dir`, {
+      method: 'POST',
+      headers: {
+        'X-File-Checksum': sha,
+        'Idempotency-Key': 'android_idem_1',
+      },
+      body: dupForm,
+    });
+    assert.equal(dupRes.status, 200);
+    const dupJson: any = await dupRes.json();
+    assert.equal(dupJson.fileId, okJson.fileId);
+    const storedAll = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id, idempotencyKey: 'android_idem_1' }).toArray();
+    assert.equal(storedAll.length, 1);
+  });
+
+  // ── 44. OneDrive move & copy use getOneDriveClient instead of stale access_token ──
+  await t.test('44. OneDrive move and copy work via getOneDriveClient even with stale account.tokens', async () => {
+    const plain = Buffer.from('OneDrive move copy payload');
+    const upRes = await uploadMultipart(String(odAccount1Id), plain, 'od-move-src.txt', {
+      fileName: 'od-move-src.txt',
+      mimeType: 'text/plain',
+    });
+    assert.equal(upRes.status, 200);
+    const upJson: any = await upRes.json();
+    const odFileId = upJson.fileId;
+
+    const mvRes = await apiFetch('/api/files/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(odAccount1Id),
+        fileId: odFileId,
+        targetAccountId: String(odAccount1Id),
+        targetFolderId: 'od_target_dir',
+      }),
+    });
+    assert.equal(mvRes.status, 200);
+    assert.equal(oneDriveBlobs.get(odFileId)?.parentId, 'od_target_dir');
+
+    const cpRes = await apiFetch('/api/files/copy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(odAccount1Id),
+        fileId: odFileId,
+        targetAccountId: String(odAccount1Id),
+        targetFolderId: 'od_copy_dir',
+      }),
+    });
+    assert.equal(cpRes.status, 200);
+    const copied = Array.from(oneDriveBlobs.values()).find((b) => b.parentId === 'od_copy_dir');
+    assert.ok(copied);
+  });
+
+  // ── 45. /api/accounts includes isDefault and handles zero quota limit without NaN/Infinity ──
+  await t.test('45. /api/accounts returns isDefault and safe quota percentage on zero limit', async () => {
+    const res = await apiFetch('/api/accounts');
+    assert.equal(res.status, 200);
+    const list: any[] = await res.json();
+    assert.equal(list.length, 3);
+    for (const acc of list) {
+      assert.equal(typeof acc.isDefault, 'boolean');
+      assert.equal(Number.isFinite(acc.percentage), true);
+      assert.equal(acc.percentage >= 0 && acc.percentage <= 100, true);
+      assert.equal(String(acc.usage).includes('NaN'), false);
+      assert.equal(String(acc.total).includes('Infinity'), false);
+    }
+  });
+
+  // ── 46. Public share page validates shareId, sets CSP, and escapes HTML/XSS payloads ──
+  await t.test('46. /s/:shareId validates shareId format, escapes HTML, and sets CSP header', async () => {
+    const badRes = await fetch(`${baseUrl}/s/bad$id!!`);
+    assert.equal(badRes.status, 400);
+
+    const xssShareId = 'share_xss_test_01';
+    const xssDoc = await mockDb.collection('tg_files').insertOne({
+      accountId: tgAccount1Id,
+      messageId: 99999,
+      name: '<script>alert(1)</script>.txt',
+      size: 12,
+      mimeType: 'text/plain',
+      folder: 'root',
+      isEncrypted: false,
+      shareId: xssShareId,
+      createdAt: new Date(),
+    });
+    assert.ok(xssDoc.insertedId);
+    const shareRes = await fetch(`${baseUrl}/s/${xssShareId}`);
+    assert.equal(shareRes.status, 200);
+    assert.ok(shareRes.headers.get('content-security-policy')?.includes("default-src 'none'"));
+    const html = await shareRes.text();
+    assert.equal(html.includes('<script>alert(1)</script>'), false);
+    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
   });
 });
