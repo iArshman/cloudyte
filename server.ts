@@ -2917,7 +2917,7 @@ app.patch('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
     if (opaqueErr) return apiError(res, opaqueErr.status, opaqueErr.code, opaqueErr.message, req.requestId);
   } else {
     const plainErr = validatePlaintextFilename(name);
-    if (plainErr) return apiError(res, plainErr.status, plainErr.code, plainErr.message, req.requestId);
+    if (!plainErr.ok) return apiError(res, plainErr.error.status, plainErr.error.code, plainErr.error.message, req.requestId);
   }
 
   try {
@@ -2958,7 +2958,7 @@ app.post('/api/folders', requireAuth, async (req: any, res: any) => {
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
   const nameErr = validatePlaintextFilename(name);
-  if (nameErr) return apiError(res, nameErr.status, nameErr.code, nameErr.message, req.requestId);
+  if (!nameErr.ok) return apiError(res, nameErr.error.status, nameErr.error.code, nameErr.error.message, req.requestId);
   const folderCheck = validateSafeFolderId(parentId);
   if (!folderCheck.ok) return apiError(res, folderCheck.error.status, folderCheck.error.code, folderCheck.error.message, req.requestId);
 
