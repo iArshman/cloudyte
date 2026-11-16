@@ -92,7 +92,7 @@ if (!fs.existsSync(THUMB_DIR)) {
   try { fs.mkdirSync(THUMB_DIR, { recursive: true }); } catch { /* ignore */ }
 }
 
-const thumbLimit = pLimit(4);
+const thumbLimit = pLimit(10);
 const inFlightThumbs = new Map<string, Promise<string | null>>();
 const providerLimits = new Map<string, ReturnType<typeof pLimit>>();
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
@@ -248,9 +248,11 @@ const authCache  = new NodeCache({ stdTTL: 60, checkperiod: 120, useClones: fals
 function invalidateDriveCache(accountId: string) {
   if (!accountId) return;
   const keys = driveCache.keys();
-  // Cache keys are namespaced as ...:<accountId>:...; avoid broad substring matches.
+  // Cache keys are namespaced as ...:<accountId>:...; also clear aggregated "all" summaries.
   const boundary = `:${accountId}:`;
-  const toDelete = keys.filter(k => k.includes(boundary) || k.endsWith(`:${accountId}`));
+  const toDelete = keys.filter(
+    k => k.includes(boundary) || k.endsWith(`:${accountId}`) || k.startsWith('storage_summary:all')
+  );
   if (toDelete.length > 0) driveCache.del(toDelete);
 }
 
@@ -350,6 +352,9 @@ async function connectToMongo() {
 
     // Additional collection indexes
     try { await db.collection('sessions').createIndex({ createdAt: 1 }, { expireAfterSeconds: 2592000 }); } catch { /* ignore */ }
+    try { await db.collection('sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
+    try { await db.collection('sessions').createIndex({ userId: 1, lastActiveAt: -1 }); } catch { /* ignore */ }
+    try { await db.collection('tg_files').createIndex({ accountId: 1, trashed: 1, trashedAt: -1 }); } catch { /* ignore */ }
     try { await db.collection('oauth_states').createIndex({ stateHash: 1, provider: 1 }, { unique: true }); } catch { /* ignore */ }
     try { await db.collection('oauth_states').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
     try { await db.collection('accounts').createIndex({ userId: 1 }); } catch { /* ignore */ }
@@ -549,6 +554,23 @@ async function getUserIdByTg(tgId: number | string, database: any) {
   return user._id;
 }
 
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+
+function parseDeviceNameFromRequest(req: any): string {
+  const headerName = typeof req.headers?.['x-device-name'] === 'string' ? req.headers['x-device-name'].trim() : '';
+  if (headerName) return headerName.slice(0, 80);
+  const ua = typeof req.headers?.['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+  if (!ua) return 'Cloudyte Client';
+  if (/okhttp|android/i.test(ua)) return 'Cloudyte Android';
+  if (/iphone|ipad|ios/i.test(ua)) return 'Cloudyte iOS';
+  if (/edg\//i.test(ua)) return 'Edge Web';
+  if (/chrome\//i.test(ua)) return 'Chrome Web';
+  if (/firefox\//i.test(ua)) return 'Firefox Web';
+  if (/safari\//i.test(ua)) return 'Safari Web';
+  return ua.slice(0, 64);
+}
+
 // ─── Auth Middleware with NodeCache ──────────────────────────────────────────
 const requireAuth = async (req: any, res: any, next: any) => {
   req.db = db;
@@ -566,22 +588,53 @@ const requireAuth = async (req: any, res: any, next: any) => {
   if (token && token.length <= 256) {
     const cachedAuth = authCache.get(token) as any;
     if (cachedAuth) {
-      req.userId  = cachedAuth.userId;
-      req.isAdmin = cachedAuth.isAdmin;
-      req.user    = cachedAuth.user;
+      if (cachedAuth.expiresAt && cachedAuth.expiresAt < Date.now()) {
+        authCache.del(token);
+        if (req.db) {
+          try { await req.db.collection('sessions').deleteOne({ token }); } catch { /* ignore */ }
+        }
+        return res.status(401).json({ error: 'Session expired' });
+      }
+      req.userId    = cachedAuth.userId;
+      req.isAdmin   = cachedAuth.isAdmin;
+      req.user      = cachedAuth.user;
+      req.sessionId = cachedAuth.sessionId;
+      req.token     = token;
       return next();
     }
 
     if (req.db) {
       const session = await req.db.collection('sessions').findOne({ token });
       if (session) {
+        const expMs = session.expiresAt ? new Date(session.expiresAt).getTime() : null;
+        if (expMs !== null && !Number.isNaN(expMs) && expMs < Date.now()) {
+          authCache.del(token);
+          try { await req.db.collection('sessions').deleteOne({ _id: session._id }); } catch { /* ignore */ }
+          return res.status(401).json({ error: 'Session expired' });
+        }
+
         const user = await req.db.collection('users').findOne({ _id: session.userId });
         if (user && user.isActive !== false) {
-          const authData = { userId: user._id, isAdmin: !!user.isAdmin, user };
+          const sessionId = String(session.sessionId || session._id);
+          const nowMs = Date.now();
+          const lastActiveMs = session.lastActiveAt ? new Date(session.lastActiveAt).getTime() : 0;
+          let nextExpMs = expMs ?? (nowMs + SESSION_TTL_MS);
+          if (!lastActiveMs || nowMs - lastActiveMs >= SESSION_TOUCH_INTERVAL_MS) {
+            const newNow = new Date(nowMs);
+            const newExp = new Date(nowMs + SESSION_TTL_MS);
+            nextExpMs = newExp.getTime();
+            req.db.collection('sessions').updateOne(
+              { _id: session._id },
+              { $set: { sessionId, lastActiveAt: newNow, expiresAt: newExp } }
+            ).catch(() => {});
+          }
+          const authData = { userId: user._id, isAdmin: !!user.isAdmin, user, sessionId, expiresAt: nextExpMs };
           authCache.set(token, authData);
-          req.userId  = user._id;
-          req.isAdmin = !!user.isAdmin;
-          req.user    = user;
+          req.userId    = user._id;
+          req.isAdmin   = !!user.isAdmin;
+          req.user      = user;
+          req.sessionId = sessionId;
+          req.token     = token;
           return next();
         }
       }
@@ -744,7 +797,8 @@ async function resolveFileMetadataForAccount(
   account: any,
   fileId: string,
   userId?: string | ObjectId | null,
-  isAdmin?: boolean
+  isAdmin?: boolean,
+  includeTrashed = false
 ): Promise<{ meta: any | null; accessDenied: boolean }> {
   const d = database || db || await connectToMongo();
   if (account.accountType === 'tgdrive') {
@@ -755,16 +809,19 @@ async function resolveFileMetadataForAccount(
     if (!isAdmin && meta.userId && userId && String(meta.userId) !== String(userId)) {
       return { meta: null, accessDenied: true };
     }
+    if (!includeTrashed && meta.trashed === true) return { meta: null, accessDenied: false };
     return { meta, accessDenied: false };
   }
   const orClauses: any[] = [{ providerFileId: fileId }];
   if (ObjectId.isValid(fileId)) orClauses.push({ _id: new ObjectId(fileId) });
-  const meta = await d.collection('tg_files').findOne({ $or: orClauses });
+  const meta = await d.collection('tg_files').findOne({ accountId: account._id, $or: orClauses })
+    || await d.collection('tg_files').findOne({ $or: orClauses });
   if (!meta) return { meta: null, accessDenied: false };
   if (String(meta.accountId) !== String(account._id)) return { meta: null, accessDenied: true };
   if (!isAdmin && meta.userId && userId && String(meta.userId) !== String(userId)) {
     return { meta: null, accessDenied: true };
   }
+  if (!includeTrashed && meta.trashed === true) return { meta: null, accessDenied: false };
   return { meta, accessDenied: false };
 }
 
@@ -1144,10 +1201,10 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
 
     if (!sourceBuffer) return null;
 
-    await sharp(sourceBuffer)
+    await sharp(sourceBuffer, { sequentialRead: true })
       .rotate()
-      .resize(s, s, { fit: 'cover' })
-      .jpeg({ quality: 75 })
+      .resize(s, s, { fit: 'cover', fastShrinkOnLoad: true })
+      .jpeg({ quality: 72, mozjpeg: true })
       .toFile(thumbPath);
 
     return thumbPath;
@@ -1159,10 +1216,10 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
     link = link.replace(/=s\d+$/, `=s${s}`);
 
     const resp = await axios.get(link, { responseType: 'arraybuffer', timeout: 20_000, maxContentLength: 20 * 1024 * 1024 });
-    await sharp(Buffer.from(resp.data))
+    await sharp(Buffer.from(resp.data), { sequentialRead: true })
       .rotate()
-      .resize(s, s, { fit: 'cover' })
-      .jpeg({ quality: 75 })
+      .resize(s, s, { fit: 'cover', fastShrinkOnLoad: true })
+      .jpeg({ quality: 72, mozjpeg: true })
       .toFile(thumbPath);
 
     return thumbPath;
@@ -1174,10 +1231,10 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
     if (!thumbUrl) return null;
 
     const resp = await axios.get(thumbUrl, { responseType: 'arraybuffer', timeout: 20_000, maxContentLength: 20 * 1024 * 1024 });
-    await sharp(Buffer.from(resp.data))
+    await sharp(Buffer.from(resp.data), { sequentialRead: true })
       .rotate()
-      .resize(s, s, { fit: 'cover' })
-      .jpeg({ quality: 75 })
+      .resize(s, s, { fit: 'cover', fastShrinkOnLoad: true })
+      .jpeg({ quality: 72, mozjpeg: true })
       .toFile(thumbPath);
 
     return thumbPath;
@@ -1333,18 +1390,35 @@ app.post('/api/login', async (req, res) => {
   if (!match) return res.status(401).json({ error: 'Invalid credentials' });
 
   const sessionToken = nanoid(32);
+  const sessionId = nanoid(12);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SESSION_TTL_MS);
+  const deviceName = parseDeviceNameFromRequest(req);
+  const userAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 256) : '';
+
   await database.collection('sessions').insertOne({
+    sessionId,
     token: sessionToken,
     userId: user._id,
     username: user.username,
-    createdAt: new Date()
+    deviceName,
+    userAgent,
+    createdAt: now,
+    lastActiveAt: now,
+    expiresAt,
   });
 
   // Prime auth cache
-  authCache.set(sessionToken, { userId: user._id, isAdmin: !!user.isAdmin, user });
+  authCache.set(sessionToken, {
+    userId: user._id,
+    isAdmin: !!user.isAdmin,
+    user,
+    sessionId,
+    expiresAt: expiresAt.getTime(),
+  });
 
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ success: true, token: sessionToken, username: user.username, isAdmin: !!user.isAdmin });
+  res.json({ success: true, token: sessionToken, sessionId, username: user.username, isAdmin: !!user.isAdmin });
 });
 
 app.get('/api/admin/stats', requireAuth, async (req: any, res: any) => {
@@ -1482,6 +1556,83 @@ app.post('/api/logout', async (req, res) => {
     await database.collection('sessions').deleteOne({ token });
   }
   res.json({ success: true });
+});
+
+// ─── Active Sessions & Device Management ──────────────────────────────────────
+app.get('/api/sessions', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  if (!req.userId) return res.json([]);
+  const now = Date.now();
+  const rawSessions = await database.collection('sessions')
+    .find({ userId: req.userId })
+    .sort({ lastActiveAt: -1, createdAt: -1 })
+    .toArray();
+
+  const active = rawSessions.filter((s: any) => {
+    if (!s.expiresAt) return true;
+    const exp = new Date(s.expiresAt).getTime();
+    return Number.isNaN(exp) || exp > now;
+  });
+
+  const sessions = active.map((s: any) => {
+    const id = String(s.sessionId || s._id);
+    const createdIso = s.createdAt ? new Date(s.createdAt).toISOString() : new Date().toISOString();
+    const lastActiveIso = (s.lastActiveAt || s.createdAt)
+      ? new Date(s.lastActiveAt || s.createdAt).toISOString()
+      : createdIso;
+    const expiresIso = s.expiresAt ? new Date(s.expiresAt).toISOString() : null;
+    return {
+      id,
+      sessionId: id,
+      deviceName: s.deviceName || 'Cloudyte Client',
+      userAgent: s.userAgent || '',
+      createdAt: createdIso,
+      lastActiveAt: lastActiveIso,
+      expiresAt: expiresIso,
+      isCurrent: Boolean(req.token && s.token === req.token),
+    };
+  });
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(sessions);
+});
+
+app.delete('/api/sessions/:sessionId', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const targetId = String(req.params.sessionId || '').trim();
+  if (!targetId) return apiError(res, 400, 'BAD_REQUEST', 'Session ID required', req.requestId);
+
+  const orClauses: any[] = [{ sessionId: targetId }, { _id: targetId }];
+  if (ObjectId.isValid(targetId)) orClauses.push({ _id: new ObjectId(targetId) });
+
+  const query: any = { $or: orClauses };
+  if (!req.isAdmin && req.userId) {
+    query.userId = req.userId;
+  }
+
+  const targetSession = await database.collection('sessions').findOne(query);
+  if (!targetSession) return apiError(res, 404, 'NOT_FOUND', 'Session not found', req.requestId);
+
+  await database.collection('sessions').deleteOne({ _id: targetSession._id });
+  if (targetSession.token) authCache.del(String(targetSession.token));
+
+  res.json({ success: true, revokedSessionId: targetId });
+});
+
+app.delete('/api/sessions', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  if (!req.userId) return apiError(res, 401, 'AUTH_REQUIRED', 'Unauthorized', req.requestId);
+
+  const filter: any = { userId: req.userId };
+  if (req.token) {
+    filter.token = { $ne: req.token };
+  }
+  const toRevoke = await database.collection('sessions').find(filter).toArray();
+  for (const s of toRevoke) {
+    if (s.token) authCache.del(String(s.token));
+  }
+  const delRes = await database.collection('sessions').deleteMany(filter);
+  res.json({ success: true, revokedCount: delRes.deletedCount || toRevoke.length });
 });
 
 // ─── TG Drive – register a channel as an account ─────────────────────────────
@@ -1625,6 +1776,153 @@ async function getAccountQuota(acc: any, database: any): Promise<{ quotaUsage: s
   return { quotaUsage, quotaLimit, displayName };
 }
 
+type StorageCategories = {
+  images: number;
+  videos: number;
+  audio: number;
+  documents: number;
+  archives: number;
+  other: number;
+};
+
+function emptyStorageCategories(): StorageCategories {
+  return { images: 0, videos: 0, audio: 0, documents: 0, archives: 0, other: 0 };
+}
+
+function classifyFileCategory(mimeRaw: string, nameRaw: string, isEncrypted = false): keyof StorageCategories {
+  if (isEncrypted) return 'other';
+  const mime = (mimeRaw || '').toLowerCase();
+  const name = (nameRaw || '').toLowerCase();
+  if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp|bmp|svg|heic|ico|tiff?|avif)$/i.test(name)) {
+    return 'images';
+  }
+  if (mime.startsWith('video/') || /\.(mp4|mkv|mov|avi|webm|flv|wmv|m4v|3gp|mpe?g)$/i.test(name)) {
+    return 'videos';
+  }
+  if (mime.startsWith('audio/') || /\.(mp3|wav|ogg|flac|aac|m4a|wma|opus)$/i.test(name)) {
+    return 'audio';
+  }
+  if (/(zip|rar|7z|tar|gz|gzip|bzip|xz|compressed)/i.test(mime) || /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst)$/i.test(name)) {
+    return 'archives';
+  }
+  if (
+    /(pdf|msword|wordprocessingml|ms-excel|spreadsheetml|ms-powerpoint|presentationml|opendocument|^text\/|rtf|csv|json|xml)/i.test(mime) ||
+    /\.(pdf|docx?|xlsx?|pptx?|txt|rtf|csv|md|odt|ods|odp)$/i.test(name)
+  ) {
+    return 'documents';
+  }
+  return 'other';
+}
+
+async function computeSingleAccountStorageSummary(account: any, database: any) {
+  const accIdStr = account._id.toString();
+  const cacheKey = `storage_summary:${accIdStr}`;
+  const cached = driveCache.get(cacheKey) as any;
+  if (cached) return cached;
+
+  if (account.accountType === 'tgdrive') {
+    const docs = await database.collection('tg_files')
+      .find({ accountId: account._id, trashed: { $ne: true } })
+      .toArray();
+    const categories = emptyStorageCategories();
+    let usedBytes = 0;
+    for (const d of docs) {
+      const sz = Number(d.encryptedSizeBytes ?? d.size ?? 0) || 0;
+      usedBytes += sz;
+      const cat = classifyFileCategory(d.mimeType || '', d.name || '', Boolean(d.isEncrypted));
+      categories[cat] += sz;
+    }
+    const summary = {
+      accountId:   accIdStr,
+      accountType: 'tgdrive' as const,
+      usedBytes,
+      totalBytes:  null as number | null,
+      fileCount:   docs.length,
+      categories,
+    };
+    driveCache.set(cacheKey, summary, 60);
+    return summary;
+  }
+
+  const { quotaUsage, quotaLimit } = await getAccountQuota(account, database);
+  const categories = emptyStorageCategories();
+  let fileCount = 0;
+  let scannedBytes = 0;
+
+  try {
+    const encryptedDocs = await database.collection('tg_files')
+      .find({ accountId: account._id, isEncrypted: true, trashed: { $ne: true } })
+      .toArray();
+    const encryptedIds = new Set<string>();
+    const encryptedNames = new Set<string>();
+    for (const ed of encryptedDocs) {
+      if (ed.providerFileId) encryptedIds.add(String(ed.providerFileId));
+      if (ed.opaqueRemoteName) encryptedNames.add(String(ed.opaqueRemoteName));
+      if (ed.name) encryptedNames.add(String(ed.name));
+    }
+
+    if (account.accountType === 'onedrive') {
+      const c = await getOneDriveClient(account.tokens || account.credentials, accIdStr);
+      let items: any[] = [];
+      try {
+        const rootChildren = await c.api('/me/drive/root/children').get();
+        items = Array.isArray(rootChildren?.value) ? rootChildren.value : [];
+      } catch { /* ignore */ }
+      for (const item of items) {
+        if (item.folder || item.deleted) continue;
+        const sz = Number(item.size) || 0;
+        const isEnc = encryptedIds.has(String(item.id)) || encryptedNames.has(String(item.name));
+        const cat = classifyFileCategory(item.file?.mimeType || '', item.name || '', isEnc);
+        categories[cat] += sz;
+        scannedBytes += sz;
+        fileCount++;
+      }
+    } else {
+      const drive = await getDriveClient(account.tokens || account.credentials);
+      let pageToken: string | undefined = undefined;
+      for (let page = 0; page < 5; page++) {
+        const listRes: any = await drive.files.list({
+          pageSize: 200,
+          ...(pageToken ? { pageToken } : {}),
+          q: "trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+          fields: 'nextPageToken,files(id,name,mimeType,size)',
+        });
+        const files = Array.isArray(listRes?.data?.files) ? listRes.data.files : [];
+        for (const f of files) {
+          if (f.mimeType === 'application/vnd.google-apps.folder') continue;
+          const sz = Number(f.size) || 0;
+          const isEnc = encryptedIds.has(String(f.id)) || encryptedNames.has(String(f.name));
+          const cat = classifyFileCategory(f.mimeType || '', f.name || '', isEnc);
+          categories[cat] += sz;
+          scannedBytes += sz;
+          fileCount++;
+        }
+        pageToken = listRes?.data?.nextPageToken;
+        if (!pageToken) break;
+      }
+    }
+  } catch (scanErr) {
+    console.warn(`[StorageSummary] Provider file scan fallback for ${accIdStr}:`, scanErr);
+  }
+
+  const effectiveUsedBytes = Math.max(Number(quotaUsage) || 0, scannedBytes);
+  if (effectiveUsedBytes > scannedBytes) {
+    categories.other += (effectiveUsedBytes - scannedBytes);
+  }
+  const limitNum = Number(quotaLimit) || 0;
+
+  const summary = {
+    accountId:   accIdStr,
+    accountType: (account.accountType === 'onedrive' ? 'onedrive' : 'google') as 'google' | 'onedrive',
+    usedBytes:   effectiveUsedBytes,
+    totalBytes:  limitNum > 0 ? limitNum : null,
+    fileCount,
+    categories,
+  };
+  driveCache.set(cacheKey, summary, 60);
+  return summary;
+}
+
 // ─── /api/accounts ────────────────────────────────────────────────────────────
 app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
   const database = req.db;
@@ -1651,18 +1949,9 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
   const enriched = await Promise.all(unique.map(async (acc: any) => {
     if (acc.accountType === 'tgdrive') {
       try {
-        const cachedSummary = driveCache.get(`storage_summary:${acc._id.toString()}`) as any;
-        let usedBytes = cachedSummary?.usedBytes;
-        let fileCount = cachedSummary?.fileCount;
-        if (usedBytes === undefined || fileCount === undefined) {
-          const pipeline = [
-            { $match: { accountId: acc._id } },
-            { $group: { _id: null, total: { $sum: { $ifNull: ['$encryptedSizeBytes', '$size'] } }, count: { $sum: 1 } } },
-          ];
-          const [agg] = await database.collection('tg_files').aggregate(pipeline).toArray();
-          usedBytes = agg?.total || 0;
-          fileCount = agg?.count || 0;
-        }
+        const summary = await computeSingleAccountStorageSummary(acc, database);
+        const usedBytes = summary.usedBytes || 0;
+        const fileCount = summary.fileCount || 0;
         return {
           id:          acc._id.toString(),
           name:        acc.name || 'TG Drive',
@@ -1676,13 +1965,14 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
           isDefault:   acc.isDefault || false,
         };
       } catch {
-        return { id: acc._id.toString(), name: acc.name || 'TG Drive', email: `Channel: ${acc.channelId}`, channelId: acc.channelId, accountType: 'tgdrive', usage: '0 GB', total: '∞', percentage: 0, error: false, isDefault: acc.isDefault || false };
+        return { id: acc._id.toString(), name: acc.name || 'TG Drive', email: `Channel: ${acc.channelId}`, channelId: acc.channelId, accountType: 'tgdrive', usage: '0 GB', total: '∞', percentage: 0, fileCount: 0, error: false, isDefault: acc.isDefault || false };
       }
     }
 
     try {
       const { quotaUsage, quotaLimit, displayName } = await getAccountQuota(acc, database);
-      const usageNum = Number(quotaUsage) || 0;
+      const cachedSummary = driveCache.get(`storage_summary:${acc._id.toString()}`) as any;
+      const usageNum = Math.max(Number(quotaUsage) || 0, Number(cachedSummary?.usedBytes) || 0);
       const limitNum = Number(quotaLimit) || 0;
       const pct = limitNum > 1 ? Math.min(100, Math.max(0, Math.round((usageNum / limitNum) * 100))) : 0;
       return {
@@ -1692,6 +1982,7 @@ app.get('/api/accounts', requireAuth, async (req: any, res: any) => {
         usage: (usageNum / (1024 ** 3)).toFixed(1) + ' GB',
         total: limitNum > 1 ? (limitNum / (1024 ** 3)).toFixed(0) + ' GB' : '∞',
         percentage: pct,
+        ...(typeof cachedSummary?.fileCount === 'number' ? { fileCount: cachedSummary.fileCount } : {}),
         accountType: acc.accountType || 'google',
         isDefault: acc.isDefault || false,
       };
@@ -1707,8 +1998,69 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
   const { accountId } = req.query;
   const database      = req.db;
 
-  if (!accountId || typeof accountId !== 'string') {
-    return res.status(400).json({ error: 'accountId is required' });
+  const isAllAccounts = !accountId || typeof accountId !== 'string' || accountId === 'all' || accountId === 'root';
+  if (isAllAccounts) {
+    const ownerKey = String(req.userId || 'admin');
+    const allCacheKey = `storage_summary:all:${ownerKey}`;
+    const cachedAll = driveCache.get(allCacheKey);
+    if (cachedAll) return res.json(cachedAll);
+
+    try {
+      const query: any = {};
+      if (!req.isAdmin || req.userId) {
+        query.userId = req.userId;
+      }
+      const accounts = await database.collection('accounts').find(query).toArray();
+      const seen = new Map();
+      const unique = accounts.filter((a: any) => {
+        const key = a.accountType === 'tgdrive' ? `tgdrive:${a.channelId}` : (a.email || a._id.toString());
+        if (seen.has(key)) return false;
+        seen.set(key, true);
+        return true;
+      });
+
+      const summaries = await Promise.all(
+        unique.map((acc: any) => computeSingleAccountStorageSummary(acc, database).catch(() => null))
+      );
+
+      const categories = emptyStorageCategories();
+      let usedBytes = 0;
+      let finiteTotalBytes = 0;
+      let hasFiniteLimit = false;
+      let fileCount = 0;
+
+      for (const s of summaries) {
+        if (!s) continue;
+        usedBytes += Number(s.usedBytes) || 0;
+        if (typeof s.totalBytes === 'number' && s.totalBytes > 0) {
+          finiteTotalBytes += s.totalBytes;
+          hasFiniteLimit = true;
+        }
+        fileCount += Number(s.fileCount) || 0;
+        if (s.categories) {
+          categories.images += Number(s.categories.images) || 0;
+          categories.videos += Number(s.categories.videos) || 0;
+          categories.audio += Number(s.categories.audio) || 0;
+          categories.documents += Number(s.categories.documents) || 0;
+          categories.archives += Number(s.categories.archives) || 0;
+          categories.other += Number(s.categories.other) || 0;
+        }
+      }
+
+      const aggregated = {
+        accountId:   'all',
+        accountType: 'all',
+        usedBytes,
+        totalBytes:  hasFiniteLimit ? finiteTotalBytes : null,
+        fileCount,
+        categories,
+      };
+      driveCache.set(allCacheKey, aggregated, 60);
+      return res.json(aggregated);
+    } catch (err: any) {
+      console.error('All-accounts storage summary error:', err);
+      return res.status(500).json({ error: err.message });
+    }
   }
 
   const { account, accessDenied, invalidId } = await resolveAuthorizedAccount(database, accountId, req.userId, req.isAdmin);
@@ -1716,130 +2068,8 @@ app.get('/api/storage/summary', requireAuth, async (req: any, res: any) => {
   if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
-  const cacheKey = `storage_summary:${accountId}`;
-  const cached = driveCache.get(cacheKey);
-  if (cached) return res.json(cached);
-
   try {
-    if (account.accountType === 'tgdrive') {
-      const sizeExpr = { $ifNull: ['$encryptedSizeBytes', { $ifNull: ['$size', 0] }] };
-      const mimeExpr = { $ifNull: ['$mimeType', ''] };
-      const nameExpr = { $ifNull: ['$name', ''] };
-      const isEncryptedExpr = { $eq: ['$isEncrypted', true] };
-
-      const isImage = {
-        $and: [
-          { $not: [isEncryptedExpr] },
-          {
-            $or: [
-              { $regexMatch: { input: mimeExpr, regex: '^image/', options: 'i' } },
-              { $regexMatch: { input: nameExpr, regex: '\\.(jpe?g|png|gif|webp|bmp|svg|heic|ico|tiff?|avif)$', options: 'i' } },
-            ],
-          },
-        ],
-      };
-      const isVideo = {
-        $and: [
-          { $not: [isEncryptedExpr] },
-          { $not: [isImage] },
-          {
-            $or: [
-              { $regexMatch: { input: mimeExpr, regex: '^video/', options: 'i' } },
-              { $regexMatch: { input: nameExpr, regex: '\\.(mp4|mkv|mov|avi|webm|flv|wmv|m4v|3gp|mpe?g)$', options: 'i' } },
-            ],
-          },
-        ],
-      };
-      const isAudio = {
-        $and: [
-          { $not: [isEncryptedExpr] },
-          { $not: [{ $or: [isImage, isVideo] }] },
-          {
-            $or: [
-              { $regexMatch: { input: mimeExpr, regex: '^audio/', options: 'i' } },
-              { $regexMatch: { input: nameExpr, regex: '\\.(mp3|wav|ogg|flac|aac|m4a|wma|opus)$', options: 'i' } },
-            ],
-          },
-        ],
-      };
-      const isArchive = {
-        $and: [
-          { $not: [isEncryptedExpr] },
-          { $not: [{ $or: [isImage, isVideo, isAudio] }] },
-          {
-            $or: [
-              { $regexMatch: { input: mimeExpr, regex: '(zip|rar|7z|tar|gz|gzip|bzip|xz|compressed)', options: 'i' } },
-              { $regexMatch: { input: nameExpr, regex: '\\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst)$', options: 'i' } },
-            ],
-          },
-        ],
-      };
-      const isDocument = {
-        $and: [
-          { $not: [isEncryptedExpr] },
-          { $not: [{ $or: [isImage, isVideo, isAudio, isArchive] }] },
-          {
-            $or: [
-              { $regexMatch: { input: mimeExpr, regex: '(pdf|msword|wordprocessingml|ms-excel|spreadsheetml|ms-powerpoint|presentationml|opendocument|^text/|rtf|csv|json|xml)', options: 'i' } },
-              { $regexMatch: { input: nameExpr, regex: '\\.(pdf|docx?|xlsx?|pptx?|txt|rtf|csv|md|odt|ods|odp)$', options: 'i' } },
-            ],
-          },
-        ],
-      };
-      const isOther = {
-        $or: [
-          isEncryptedExpr,
-          { $not: [{ $or: [isImage, isVideo, isAudio, isArchive, isDocument] }] },
-        ],
-      };
-
-      const pipeline = [
-        { $match: { accountId: account._id } },
-        {
-          $group: {
-            _id:       null,
-            usedBytes: { $sum: sizeExpr },
-            fileCount: { $sum: 1 },
-            images:    { $sum: { $cond: [isImage, sizeExpr, 0] } },
-            videos:    { $sum: { $cond: [isVideo, sizeExpr, 0] } },
-            audio:     { $sum: { $cond: [isAudio, sizeExpr, 0] } },
-            documents: { $sum: { $cond: [isDocument, sizeExpr, 0] } },
-            archives:  { $sum: { $cond: [isArchive, sizeExpr, 0] } },
-            other:     { $sum: { $cond: [isOther, sizeExpr, 0] } },
-          },
-        },
-      ];
-
-      const [agg] = await database.collection('tg_files').aggregate(pipeline).toArray();
-      const summary = {
-        accountId:   account._id.toString(),
-        accountType: 'tgdrive' as const,
-        usedBytes:   agg?.usedBytes || 0,
-        totalBytes:  null,
-        fileCount:   agg?.fileCount || 0,
-        categories: {
-          images:    agg?.images || 0,
-          videos:    agg?.videos || 0,
-          audio:     agg?.audio || 0,
-          documents: agg?.documents || 0,
-          archives:  agg?.archives || 0,
-          other:     agg?.other || 0,
-        },
-      };
-      driveCache.set(cacheKey, summary, 60);
-      return res.json(summary);
-    }
-
-    const { quotaUsage, quotaLimit } = await getAccountQuota(account, database);
-    const summary = {
-      accountId:   account._id.toString(),
-      accountType: (account.accountType === 'onedrive' ? 'onedrive' : 'google') as 'google' | 'onedrive',
-      usedBytes:   Number(quotaUsage) || 0,
-      totalBytes:  Number(quotaLimit) || 0,
-      fileCount:   null,
-      categories:  null,
-    };
-    driveCache.set(cacheKey, summary, 60);
+    const summary = await computeSingleAccountStorageSummary(account, database);
     return res.json(summary);
   } catch (err: any) {
     console.error('Storage summary error:', err);
@@ -2072,7 +2302,7 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
         } catch { /* ignore invalid cursor */ }
       }
 
-      const fileFilter: any = { accountId: account._id };
+      const fileFilter: any = { accountId: account._id, trashed: { $ne: true } };
       if (search) {
         const escaped = escapeRegex(search as string);
         // Never search inside encryptedMetadata; only match on name (which is opaque for encrypted files)
@@ -2287,12 +2517,49 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
   }
 });
 
-// ─── Delete file ──────────────────────────────────────────────────────────────
+// ─── Delete file (Soft-delete to Trash by default; ?permanent=true for hard delete) ───
+async function permanentlyDeleteSingleFile(database: any, account: any, fileId: string, userId: any, isAdmin: boolean) {
+  if (account.accountType === 'tgdrive') {
+    const { meta, accessDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, isAdmin, true);
+    if (accessDenied) {
+      const err: any = new Error('Access denied to this file');
+      err.status = 403;
+      throw err;
+    }
+    if (!meta) {
+      const err: any = new Error('File not found');
+      err.status = 404;
+      throw err;
+    }
+    const referenceCount = await database.collection('tg_files').countDocuments({
+      messageId: meta.messageId,
+      accountId: meta.accountId,
+    });
+    if (referenceCount <= 1) {
+      const telegram = await getTgClient();
+      const peer     = await resolvePeer(telegram, account.channelId);
+      try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* message may already be gone */ }
+    }
+    await database.collection('tg_files').deleteOne({ _id: meta._id });
+  } else if (account.accountType === 'onedrive') {
+    const c = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
+    try { await c.api(`/me/drive/items/${fileId}`).delete(); } catch { /* may already be deleted */ }
+    await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(fileId) });
+  } else {
+    const drive = await getDriveClient(account.tokens || account.credentials);
+    await drive.files.delete({ fileId });
+    await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(fileId) });
+  }
+  deleteThumbFiles(fileId, String(account._id));
+  invalidateDriveCache(String(account._id));
+}
+
 app.delete('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
   const { fileId }    = req.params;
-  const { accountId } = req.query;
+  const { accountId, permanent } = req.query;
   const userId        = req.userId;
   const database      = req.db;
+  const isPermanent   = permanent === 'true' || permanent === '1';
 
   if (!isSafeProviderItemId(fileId)) {
     return apiError(res, 400, 'BAD_REQUEST', 'Invalid file identifier', req.requestId);
@@ -2303,37 +2570,328 @@ app.delete('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
   if (!account) return res.status(404).json({ error: 'Account not found' });
 
   try {
-    if (account.accountType === 'tgdrive') {
-      const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin);
-      if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
-      if (!meta) return res.status(404).json({ error: 'File not found' });
-      
-      const referenceCount = await database.collection('tg_files').countDocuments({ messageId: meta.messageId, accountId: meta.accountId });
-      
-      if (referenceCount <= 1) {
-        const telegram = await getTgClient();
-        const peer     = await resolvePeer(telegram, account.channelId);
-        try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* message may already be gone */ }
+    if (isPermanent) {
+      try {
+        await permanentlyDeleteSingleFile(database, account, fileId, userId, !!req.isAdmin);
+      } catch (e: any) {
+        if (e.status === 403) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', e.message, req.requestId);
+        if (e.status === 404) return res.status(404).json({ error: e.message });
+        throw e;
       }
-      
-      await database.collection('tg_files').deleteOne({ _id: meta._id });
-    } else if (account.accountType === 'onedrive') {
-      const c = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
-      await c.api(`/me/drive/items/${fileId}`).delete();
-      await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(fileId) });
-    } else {
-      const drive = await getDriveClient(account.tokens || account.credentials);
-      await drive.files.delete({ fileId });
-      await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(fileId) });
+      return res.json({ success: true, permanent: true });
     }
 
-    deleteThumbFiles(fileId, String(account._id));
+    // Soft-delete into Trash
+    const now = new Date();
+    if (account.accountType === 'tgdrive') {
+      const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin, true);
+      if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+      if (!meta) return res.status(404).json({ error: 'File not found' });
+
+      await database.collection('tg_files').updateOne(
+        { _id: meta._id },
+        { $set: { trashed: true, trashedAt: now, updatedAt: Date.now() } }
+      );
+    } else if (account.accountType === 'onedrive') {
+      const c = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
+      let itemMeta: any = null;
+      try { itemMeta = await c.api(`/me/drive/items/${fileId}`).get(); } catch { /* ignore */ }
+      await c.api(`/me/drive/items/${fileId}`).delete();
+      const existingSidecar = await database.collection('tg_files').findOne({ accountId: account._id, providerFileId: String(fileId) });
+      if (existingSidecar) {
+        await database.collection('tg_files').updateOne(
+          { _id: existingSidecar._id },
+          { $set: { trashed: true, trashedAt: now, updatedAt: Date.now() } }
+        );
+      } else if (itemMeta) {
+        await database.collection('tg_files').insertOne({
+          accountId: account._id,
+          ...(userId ? { userId: String(userId) } : {}),
+          providerFileId: String(fileId),
+          name: itemMeta.name || String(fileId),
+          mimeType: itemMeta.file?.mimeType || 'application/octet-stream',
+          size: Number(itemMeta.size) || 0,
+          isEncrypted: false,
+          trashed: true,
+          trashedAt: now,
+          date: Math.floor(now.getTime() / 1000),
+          updatedAt: now.getTime(),
+        });
+      }
+    } else {
+      const drive = await getDriveClient(account.tokens || account.credentials);
+      await drive.files.update({ fileId, requestBody: { trashed: true } });
+      await database.collection('tg_files').updateMany(
+        { accountId: account._id, providerFileId: String(fileId) },
+        { $set: { trashed: true, trashedAt: now, updatedAt: Date.now() } }
+      );
+    }
+
     invalidateDriveCache(accountId as string);
-    res.json({ success: true });
+    res.json({ success: true, trashed: true, fileId });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ─── Trash / Recycle Bin Endpoints ────────────────────────────────────────────
+async function listTrashForAccount(database: any, account: any): Promise<any[]> {
+  const accIdStr = String(account._id);
+  if (account.accountType === 'tgdrive') {
+    const raw = await database.collection('tg_files')
+      .find({ accountId: account._id, trashed: true })
+      .sort({ trashedAt: -1, date: -1 })
+      .limit(200)
+      .toArray();
+    return raw.map((f: any) => ({
+      ...normaliseTgFile(f, accIdStr),
+      accountId: accIdStr,
+      trashed: true,
+      trashedAt: f.trashedAt ? new Date(f.trashedAt).getTime() : Date.now(),
+    }));
+  }
+
+  if (account.accountType === 'google') {
+    const drive = await getDriveClient(account.tokens || account.credentials);
+    const listRes: any = await drive.files.list({
+      pageSize: 100,
+      q: "trashed = true and mimeType != 'application/vnd.google-apps.folder'",
+      fields: 'files(id,name,mimeType,size,modifiedTime,createdTime,webViewLink)',
+    });
+    const gFiles = Array.isArray(listRes?.data?.files) ? listRes.data.files : [];
+    const sidecars = await database.collection('tg_files')
+      .find({ accountId: account._id, trashed: true })
+      .toArray();
+    const sidecarByProviderId = new Map<string, any>();
+    for (const s of sidecars) {
+      if (s.providerFileId) sidecarByProviderId.set(String(s.providerFileId), s);
+    }
+
+    return gFiles.map((f: any) => {
+      const encMeta = sidecarByProviderId.get(String(f.id));
+      const updatedAt = f.modifiedTime ? new Date(f.modifiedTime).getTime() : Date.now();
+      if (encMeta && encMeta.isEncrypted === true) {
+        const encSize = Number(encMeta.encryptedSizeBytes ?? f.size ?? encMeta.size ?? 0);
+        return {
+          id: f.id,
+          accountId: accIdStr,
+          name: encMeta.opaqueRemoteName || f.name,
+          type: 'other',
+          mimeType: 'application/octet-stream',
+          size: encSize ? (encSize / (1024 ** 2)).toFixed(1) + ' MB' : '0.0 MB',
+          sizeBytes: encSize,
+          encryptedSizeBytes: encSize,
+          modified: f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : '-',
+          createdAt: f.createdTime ? new Date(f.createdTime).toLocaleDateString() : '-',
+          updatedAt,
+          thumbUrl: null,
+          isEncrypted: true,
+          encryptionFormatVersion: encMeta.encryptionFormatVersion ?? 1,
+          encryptionKeyId: encMeta.encryptionKeyId ?? null,
+          encryptedChecksum: encMeta.encryptedChecksum ?? null,
+          encryptedMetadata: encMeta.encryptedMetadata ?? null,
+          trashed: true,
+          trashedAt: encMeta.trashedAt ? new Date(encMeta.trashedAt).getTime() : updatedAt,
+        };
+      }
+      const sz = Number(f.size) || 0;
+      return {
+        id: f.id,
+        accountId: accIdStr,
+        name: f.name,
+        type: 'other',
+        mimeType: f.mimeType || 'application/octet-stream',
+        size: sz ? (sz / (1024 ** 2)).toFixed(1) + ' MB' : '-',
+        sizeBytes: sz,
+        modified: f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : '-',
+        createdAt: f.createdTime ? new Date(f.createdTime).toLocaleDateString() : '-',
+        updatedAt,
+        thumbUrl: null,
+        isEncrypted: false,
+        trashed: true,
+        trashedAt: updatedAt,
+      };
+    });
+  }
+
+  // OneDrive: return tracked trashed items in tg_files
+  const odTrashed = await database.collection('tg_files')
+    .find({ accountId: account._id, trashed: true })
+    .sort({ trashedAt: -1 })
+    .toArray();
+  return odTrashed.map((f: any) => ({
+    ...normaliseTgFile(f, accIdStr),
+    id: String(f.providerFileId || f._id),
+    accountId: accIdStr,
+    isTgDrive: false,
+    trashed: true,
+    trashedAt: f.trashedAt ? new Date(f.trashedAt).getTime() : Date.now(),
+  }));
+}
+
+app.get('/api/trash', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.query;
+  const database      = req.db;
+  const userId        = req.userId;
+
+  try {
+    if (!accountId || accountId === 'all' || accountId === 'root') {
+      const accQuery: any = {};
+      if (!req.isAdmin || userId) accQuery.userId = userId;
+      const accounts = await database.collection('accounts').find(accQuery).toArray();
+      const lists = await Promise.all(
+        accounts.map((acc: any) => listTrashForAccount(database, acc).catch(() => []))
+      );
+      const merged = lists.flat().sort((a: any, b: any) => (b.trashedAt || 0) - (a.trashedAt || 0));
+      return res.json(merged);
+    }
+
+    const { account, accessDenied, invalidId } = await resolveAuthorizedAccount(database, accountId as string, userId, req.isAdmin);
+    if (invalidId) return apiError(res, 400, 'BAD_REQUEST', 'Invalid accountId', req.requestId);
+    if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    const items = await listTrashForAccount(database, account);
+    return res.json(items);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/trash/restore', requireAuth, async (req: any, res: any) => {
+  const { accountId, fileId } = req.body || {};
+  const database              = req.db;
+  const userId                = req.userId;
+
+  if (!isSafeProviderItemId(fileId)) {
+    return apiError(res, 400, 'BAD_REQUEST', 'Invalid file identifier', req.requestId);
+  }
+
+  const { account, accessDenied, invalidId } = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
+  if (invalidId) return apiError(res, 400, 'BAD_REQUEST', 'Invalid accountId', req.requestId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  try {
+    if (account.accountType === 'tgdrive') {
+      const { meta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, account, fileId, userId, req.isAdmin, true);
+      if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
+      if (!meta) return res.status(404).json({ error: 'File not found in trash' });
+
+      await database.collection('tg_files').updateOne(
+        { _id: meta._id },
+        { $set: { trashed: false, updatedAt: Date.now() }, $unset: { trashedAt: '' } }
+      );
+    } else if (account.accountType === 'google') {
+      const drive = await getDriveClient(account.tokens || account.credentials);
+      await drive.files.update({ fileId, requestBody: { trashed: false } });
+      await database.collection('tg_files').updateMany(
+        { accountId: account._id, providerFileId: String(fileId) },
+        { $set: { trashed: false, updatedAt: Date.now() }, $unset: { trashedAt: '' } }
+      );
+    } else if (account.accountType === 'onedrive') {
+      const c = await getOneDriveClient(account.tokens || account.credentials, account._id.toString());
+      try {
+        const restoreReq = c.api(`/me/drive/items/${fileId}/restore`);
+        if (typeof restoreReq.post === 'function') await restoreReq.post({});
+      } catch { /* ignore if provider item already restored */ }
+      await database.collection('tg_files').updateMany(
+        { accountId: account._id, providerFileId: String(fileId) },
+        { $set: { trashed: false, updatedAt: Date.now() }, $unset: { trashedAt: '' } }
+      );
+    }
+
+    invalidateDriveCache(String(account._id));
+    return res.json({ success: true, restored: true, fileId });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/trash/:fileId', requireAuth, async (req: any, res: any) => {
+  const { fileId }    = req.params;
+  const { accountId } = req.query;
+  const database      = req.db;
+  const userId        = req.userId;
+
+  if (!isSafeProviderItemId(fileId)) {
+    return apiError(res, 400, 'BAD_REQUEST', 'Invalid file identifier', req.requestId);
+  }
+
+  const { account, accessDenied, invalidId } = await resolveAuthorizedAccount(database, accountId as string, userId, req.isAdmin);
+  if (invalidId) return apiError(res, 400, 'BAD_REQUEST', 'Invalid accountId', req.requestId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  try {
+    await permanentlyDeleteSingleFile(database, account, fileId, userId, !!req.isAdmin);
+    return res.json({ success: true, deletedPermanently: true, fileId });
+  } catch (e: any) {
+    if (e.status === 403) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', e.message, req.requestId);
+    if (e.status === 404) return res.status(404).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/trash', requireAuth, async (req: any, res: any) => {
+  const { accountId } = req.query;
+  const database      = req.db;
+  const userId        = req.userId;
+
+  try {
+    let targetAccounts: any[] = [];
+    if (!accountId || accountId === 'all' || accountId === 'root') {
+      const accQuery: any = {};
+      if (!req.isAdmin || userId) accQuery.userId = userId;
+      targetAccounts = await database.collection('accounts').find(accQuery).toArray();
+    } else {
+      const { account, accessDenied, invalidId } = await resolveAuthorizedAccount(database, accountId as string, userId, req.isAdmin);
+      if (invalidId) return apiError(res, 400, 'BAD_REQUEST', 'Invalid accountId', req.requestId);
+      if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
+      if (!account) return res.status(404).json({ error: 'Account not found' });
+      targetAccounts = [account];
+    }
+
+    let deletedCount = 0;
+    for (const acc of targetAccounts) {
+      const items = await listTrashForAccount(database, acc).catch(() => []);
+      for (const item of items) {
+        try {
+          await permanentlyDeleteSingleFile(database, acc, String(item.id), userId, !!req.isAdmin);
+          deletedCount++;
+        } catch { /* ignore individual item failure during bulk empty */ }
+      }
+      invalidateDriveCache(String(acc._id));
+    }
+    return res.json({ success: true, deletedCount });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+async function sweepExpiredTrash() {
+  const database = db || await connectToMongo();
+  if (!database) return 0;
+  const cutoff = new Date(Date.now() - TRASH_RETENTION_MS);
+  const expired = await database.collection('tg_files')
+    .find({ trashed: true, trashedAt: { $lte: cutoff } })
+    .limit(100)
+    .toArray();
+  let purged = 0;
+  for (const meta of expired) {
+    try {
+      const acc = await database.collection('accounts').findOne({ _id: meta.accountId });
+      if (acc) {
+        await permanentlyDeleteSingleFile(database, acc, String(meta.providerFileId || meta._id), meta.userId, true);
+      } else {
+        await database.collection('tg_files').deleteOne({ _id: meta._id });
+      }
+      purged++;
+    } catch { /* ignore */ }
+  }
+  return purged;
+}
 
 // ─── Rename file ──────────────────────────────────────────────────────────────
 app.patch('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
@@ -3848,7 +4406,7 @@ app.get('/s/:shareId', async (req: any, res: any) => {
   res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline' https://cdn.tailwindcss.com; script-src https://cdn.tailwindcss.com; img-src 'self' https: data:; frame-ancestors 'none'; base-uri 'none'");
 
   try {
-    const tgMeta = await database.collection('tg_files').findOne({ shareId });
+    const tgMeta = await database.collection('tg_files').findOne({ shareId, trashed: { $ne: true } });
     if (tgMeta) {
       if (tgMeta.isEncrypted === true) {
         return apiError(res, 409, 'ENCRYPTED_SHARE_UNSUPPORTED', 'Encrypted file sharing is not supported', req.requestId);
@@ -3872,7 +4430,7 @@ app.get('/s/:shareId', async (req: any, res: any) => {
 
     if (account.accountType === 'tgdrive') {
       if (!ObjectId.isValid(String(share.fileId))) return res.status(404).send('Share link expired or invalid');
-      const tgDoc = await database.collection('tg_files').findOne({ _id: new ObjectId(String(share.fileId)), accountId: account._id });
+      const tgDoc = await database.collection('tg_files').findOne({ _id: new ObjectId(String(share.fileId)), accountId: account._id, trashed: { $ne: true } });
       if (!tgDoc) return res.status(404).send('File no longer exists');
       const sizeMB = tgDoc.size ? (Number(tgDoc.size) / (1024 ** 2)).toFixed(2) + ' MB' : 'Unknown size';
       const isMedia = tgDoc.mimeType?.startsWith('image/') || tgDoc.mimeType?.startsWith('video/');
@@ -4064,6 +4622,13 @@ function oauthSuccessPage(service: string) {
 }
 
 // ─── Cross Account File Transfer Helper ───────────────────────────────────────
+type TransferProgressInfo = {
+  stage: string;
+  bytesProcessed: number;
+  totalBytes: number;
+  progressPct: number;
+};
+
 async function crossAccountTransfer(
   sourceAccountId: string,
   fileId: string,
@@ -4072,7 +4637,8 @@ async function crossAccountTransfer(
   userId: any,
   isAdmin: boolean,
   database: any,
-  isMove: boolean
+  isMove: boolean,
+  onProgress?: (info: TransferProgressInfo) => Promise<void> | void
 ) {
   const { account: sourceAccount, accessDenied: srcDenied } = await resolveAuthorizedAccount(database, sourceAccountId, userId, isAdmin);
   if (srcDenied) throw new Error('Access denied to source account');
@@ -4090,20 +4656,26 @@ async function crossAccountTransfer(
   
   let fileName = sourceMeta?.isEncrypted ? (sourceMeta.opaqueRemoteName || sourceMeta.name) : 'unknown';
   let mimeType = sourceMeta?.isEncrypted ? 'application/octet-stream' : 'application/octet-stream';
+  let expectedBytes = Number(sourceMeta?.encryptedSizeBytes ?? sourceMeta?.size ?? 0) || 0;
 
   try {
+    await onProgress?.({ stage: 'downloading', bytesProcessed: 0, totalBytes: expectedBytes, progressPct: 5 });
+
     if (sourceAccount.accountType === 'tgdrive') {
       const meta = sourceMeta;
       if (!meta) throw new Error('File not found in TG');
       fileName = meta.isEncrypted ? (meta.opaqueRemoteName || meta.name) : meta.name;
       mimeType = meta.isEncrypted ? 'application/octet-stream' : meta.mimeType;
+      expectedBytes = Number(meta.encryptedSizeBytes ?? meta.size ?? 0) || 0;
       
       const telegram = await getTgClient();
       const peer = await resolvePeer(telegram, sourceAccount.channelId);
       const messages = await telegram.getMessages(peer, { ids: [meta.messageId] });
       if (!messages || !messages[0] || !messages[0].media) throw new Error('Message not found');
       
+      let downloaded = 0;
       for await (const chunk of telegram.iterDownload({ file: messages[0].media, requestSize: 1024 * 1024 })) {
+        downloaded += chunk.length;
         if (!writeStream.write(chunk)) {
           await new Promise<void>((res, rej) => {
             const onDrain = () => { cleanup(); res(); };
@@ -4113,6 +4685,8 @@ async function crossAccountTransfer(
             writeStream.once('error', onErr);
           });
         }
+        const pct = expectedBytes > 0 ? Math.min(50, 5 + Math.round((downloaded / expectedBytes) * 45)) : 25;
+        await onProgress?.({ stage: 'downloading', bytesProcessed: downloaded, totalBytes: expectedBytes, progressPct: pct });
       }
       writeStream.end();
       await new Promise<void>((res, rej) => { writeStream.on('finish', () => res()); writeStream.on('error', rej); });
@@ -4123,6 +4697,7 @@ async function crossAccountTransfer(
         fileName = item.name;
         mimeType = item.file?.mimeType || mimeType;
       }
+      expectedBytes = Number(item.size) || expectedBytes;
 
       const dlUrl = item['@microsoft.graph.downloadUrl'];
       if (!dlUrl) throw new Error('Download link not available');
@@ -4130,17 +4705,20 @@ async function crossAccountTransfer(
       await stream.promises.pipeline(response.data, writeStream);
     } else if (sourceAccount.accountType === 'google') {
       const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
-      const file = await drive.files.get({ fileId, fields: 'name,mimeType' });
+      const file = await drive.files.get({ fileId, fields: 'name,mimeType,size' });
       if (!sourceMeta?.isEncrypted) {
         fileName = file.data.name || 'unknown';
         mimeType = file.data.mimeType || mimeType;
       }
+      expectedBytes = Number(file.data.size) || expectedBytes;
       
       const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
       await stream.promises.pipeline(response.data, writeStream);
     }
 
     const stat = await fs.promises.stat(tmpPath);
+    await onProgress?.({ stage: 'uploading', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 55 });
+
     const encryptionSpec: ValidatedUploadSpec | undefined = sourceMeta?.isEncrypted ? {
       isEncrypted: true,
       fileName: sourceMeta.opaqueRemoteName || sourceMeta.name,
@@ -4166,8 +4744,10 @@ async function crossAccountTransfer(
       encryptionSpec,
       String(userId || targetAccount.userId || '')
     );
+    await onProgress?.({ stage: 'uploading', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 90 });
 
     if (isMove) {
+      await onProgress?.({ stage: 'finalizing', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 95 });
       deleteThumbFiles(fileId, String(sourceAccount._id));
       if (sourceAccount.accountType === 'tgdrive') {
         if (sourceMeta) {
@@ -4186,6 +4766,8 @@ async function crossAccountTransfer(
         if (sourceMeta) await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
       }
     }
+
+    await onProgress?.({ stage: 'completed', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 100 });
   } finally {
     try { writeStream.destroy(); } catch { /* ignore */ }
     try { await fs.promises.unlink(tmpPath); } catch { /* ignore */ }
@@ -4198,6 +4780,10 @@ async function enqueueTransferJob(database: any, payload: any) {
     _id: nanoid(32),
     type: 'cross_account_transfer',
     status: 'queued',
+    stage: 'queued',
+    progressPct: 0,
+    bytesProcessed: 0,
+    totalBytes: 0,
     attempts: 0,
     maxAttempts: JOB_MAX_ATTEMPTS,
     payload,
@@ -4215,6 +4801,10 @@ function publicJob(job: any) {
     id: String(job._id),
     type: job.type,
     status: job.status,
+    stage: job.stage || job.status,
+    progressPct: typeof job.progressPct === 'number' ? job.progressPct : (job.status === 'completed' ? 100 : 0),
+    bytesProcessed: job.bytesProcessed || 0,
+    totalBytes: job.totalBytes || 0,
     attempts: job.attempts || 0,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -4239,7 +4829,7 @@ async function runJobWorker() {
         ],
       },
       {
-        $set: { status: 'running', startedAt: now, updatedAt: now, leaseUntil: new Date(Date.now() + JOB_LEASE_MS) },
+        $set: { status: 'running', stage: 'starting', startedAt: now, updatedAt: now, leaseUntil: new Date(Date.now() + JOB_LEASE_MS) },
         $inc: { attempts: 1 },
       },
       { sort: { createdAt: 1 }, returnDocument: 'after' }
@@ -4249,14 +4839,50 @@ async function runJobWorker() {
 
     try {
       const p = job.payload;
+      let lastUpdateMs = 0;
       await providerLimit(`transfer:${p.sourceAccountId}:${p.targetAccountId}`, 1)(() =>
-        crossAccountTransfer(p.sourceAccountId, p.fileId, p.targetAccountId, p.targetFolderId, p.userId, p.isAdmin, db, p.isMove)
+        crossAccountTransfer(
+          p.sourceAccountId,
+          p.fileId,
+          p.targetAccountId,
+          p.targetFolderId,
+          p.userId,
+          p.isAdmin,
+          db,
+          p.isMove,
+          async (info) => {
+            const nowMs = Date.now();
+            if (info.progressPct < 100 && nowMs - lastUpdateMs < 200) return;
+            lastUpdateMs = nowMs;
+            await db.collection('jobs').updateOne(
+              { _id: job._id },
+              {
+                $set: {
+                  stage: info.stage,
+                  progressPct: info.progressPct,
+                  bytesProcessed: info.bytesProcessed,
+                  totalBytes: info.totalBytes,
+                  updatedAt: new Date(nowMs),
+                },
+              }
+            );
+          }
+        )
       );
       invalidateDriveCache(p.sourceAccountId);
       invalidateDriveCache(p.targetAccountId);
       await db.collection('jobs').updateOne(
         { _id: job._id, status: 'running' },
-        { $set: { status: 'completed', completedAt: new Date(), updatedAt: new Date() }, $unset: { leaseUntil: '' } }
+        {
+          $set: {
+            status: 'completed',
+            stage: 'completed',
+            progressPct: 100,
+            completedAt: new Date(),
+            updatedAt: new Date(),
+          },
+          $unset: { leaseUntil: '' },
+        }
       );
     } catch (err: any) {
       const attempts = Number(job.attempts || 1);
@@ -4264,8 +4890,8 @@ async function runJobWorker() {
       await db.collection('jobs').updateOne(
         { _id: job._id, status: 'running' },
         retry
-          ? { $set: { status: 'queued', error: err.message || 'Transfer failed', nextRunAt: new Date(Date.now() + Math.min(60, 2 ** attempts) * 1000), updatedAt: new Date() }, $unset: { leaseUntil: '' } }
-          : { $set: { status: 'failed', error: err.message || 'Transfer failed', updatedAt: new Date() }, $unset: { leaseUntil: '' } }
+          ? { $set: { status: 'queued', stage: 'retrying', error: err.message || 'Transfer failed', nextRunAt: new Date(Date.now() + Math.min(60, 2 ** attempts) * 1000), updatedAt: new Date() }, $unset: { leaseUntil: '' } }
+          : { $set: { status: 'failed', stage: 'failed', error: err.message || 'Transfer failed', updatedAt: new Date() }, $unset: { leaseUntil: '' } }
       );
     }
   } catch (err) {
@@ -4284,13 +4910,78 @@ app.get('/api/jobs/:jobId', requireAuth, async (req: any, res: any) => {
   res.json(publicJob(job));
 });
 
+app.get('/api/jobs/:jobId/stream', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const query: any = { _id: req.params.jobId };
+  if (!req.isAdmin && req.userId) query['payload.userId'] = String(req.userId);
+  const initialJob = await database.collection('jobs').findOne(query);
+  if (!initialJob) return apiError(res, 404, 'JOB_NOT_FOUND', 'Job not found', req.requestId);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  let closed = false;
+  const sendEvent = (jobDoc: any) => {
+    if (closed || res.writableEnded) return;
+    res.write(`data: ${JSON.stringify(publicJob(jobDoc))}\n\n`);
+  };
+
+  sendEvent(initialJob);
+  if (initialJob.status === 'completed' || initialJob.status === 'failed') {
+    return res.end();
+  }
+
+  // Trigger worker immediately if job is queued
+  if (initialJob.status === 'queued') {
+    runJobWorker().catch(() => {});
+  }
+
+  let lastSnapshot = `${initialJob.status}:${initialJob.stage}:${initialJob.progressPct}`;
+  const pollTimer = setInterval(async () => {
+    if (closed || res.writableEnded) {
+      clearInterval(pollTimer);
+      return;
+    }
+    try {
+      const current = await database.collection('jobs').findOne(query);
+      if (!current) {
+        clearInterval(pollTimer);
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      if (current.status === 'queued' && !jobWorkerRunning) {
+        runJobWorker().catch(() => {});
+      }
+      const snap = `${current.status}:${current.stage}:${current.progressPct}`;
+      if (snap !== lastSnapshot) {
+        lastSnapshot = snap;
+        sendEvent(current);
+      }
+      if (current.status === 'completed' || current.status === 'failed') {
+        clearInterval(pollTimer);
+        if (!res.writableEnded) res.end();
+      }
+    } catch {
+      clearInterval(pollTimer);
+      if (!res.writableEnded) res.end();
+    }
+  }, 150);
+
+  req.on('close', () => {
+    closed = true;
+    clearInterval(pollTimer);
+  });
+});
+
 app.post('/api/jobs/:jobId/retry', requireAuth, async (req: any, res: any) => {
   const database = req.db || db || await connectToMongo();
   const query: any = { _id: req.params.jobId, status: 'failed' };
   if (!req.isAdmin && req.userId) query['payload.userId'] = String(req.userId);
   const result = await database.collection('jobs').findOneAndUpdate(
     query,
-    { $set: { status: 'queued', nextRunAt: new Date(), updatedAt: new Date() }, $unset: { error: '', leaseUntil: '' } },
+    { $set: { status: 'queued', stage: 'queued', progressPct: 0, nextRunAt: new Date(), updatedAt: new Date() }, $unset: { error: '', leaseUntil: '' } },
     { returnDocument: 'after' }
   ) as any;
   const job = result?.value ?? result;
@@ -4395,6 +5086,7 @@ if (process.env.CLOUDYTE_TEST_MODE !== '1') {
   backgroundIntervals.push(setInterval(() => pruneThumbDir(THUMB_DIR), 3600000));
   backgroundIntervals.push(setInterval(() => pruneTempFiles(), 3600000));
   backgroundIntervals.push(setInterval(() => sweepUploadSessions().catch(err => console.error('[UploadSessions] Sweep failed:', err)), 5 * 60 * 1000));
+  backgroundIntervals.push(setInterval(() => sweepExpiredTrash().catch(err => console.error('[Trash] Sweep failed:', err)), 60 * 60 * 1000));
   runJobWorker();
   backgroundIntervals.push(setInterval(() => runJobWorker(), 2000));
   server = app.listen(Number(PORT), '0.0.0.0', () => console.log(`Cloudyte running at http://localhost:${PORT}`));
@@ -4403,6 +5095,5 @@ if (process.env.CLOUDYTE_TEST_MODE !== '1') {
   server.keepAliveTimeout = 65_000;
 }
 
-export { sweepUploadSessions, pruneTempFiles, pruneThumbDir };
+export { sweepUploadSessions, sweepExpiredTrash, runJobWorker, pruneTempFiles, pruneThumbDir };
 export default app;
-
