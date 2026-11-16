@@ -22,6 +22,8 @@ const {
   app,
   setTestDependencies,
   sweepUploadSessions,
+  sweepExpiredTrash,
+  runJobWorker,
   runEncryptionMigration,
 } = await import('./server.ts');
 
@@ -313,7 +315,7 @@ test('computeFileSha256 streams multi-chunk files without full memory buffering'
 test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
   const mockDb = new InMemoryDatabase();
   const telegramBlobs = new Map<number, { bytes: Buffer; caption: string; fileName: string }>();
-  const googleBlobs = new Map<string, { bytes: Buffer; name: string; mimeType: string; parents: string[] }>();
+  const googleBlobs = new Map<string, { bytes: Buffer; name: string; mimeType: string; parents: string[]; trashed?: boolean }>();
   const oneDriveBlobs = new Map<string, { bytes: Buffer; name: string; mimeType: string; parentId: string }>();
   let nextTgMsgId = 1000;
   let nextGoogleId = 2000;
@@ -404,16 +406,24 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
         });
         return { data: { id, name: requestBody.name } };
       },
-      list: async () => {
-        const files = Array.from(googleBlobs.entries()).map(([id, g]) => ({
-          id,
-          name: g.name,
-          mimeType: g.mimeType,
-          size: String(g.bytes.length),
-          modifiedTime: new Date().toISOString(),
-          createdTime: new Date().toISOString(),
-          webViewLink: `https://drive.google.com/file/d/${id}`,
-        }));
+      list: async ({ q }: any = {}) => {
+        const wantTrashed = typeof q === 'string' && q.includes('trashed = true');
+        const wantNotTrashed = typeof q === 'string' && q.includes('trashed = false');
+        const files = Array.from(googleBlobs.entries())
+          .filter(([, g]) => {
+            if (wantTrashed) return g.trashed === true;
+            if (wantNotTrashed) return !g.trashed;
+            return true;
+          })
+          .map(([id, g]) => ({
+            id,
+            name: g.name,
+            mimeType: g.mimeType,
+            size: String(g.bytes.length),
+            modifiedTime: new Date().toISOString(),
+            createdTime: new Date().toISOString(),
+            webViewLink: `https://drive.google.com/file/d/${id}`,
+          }));
         return { data: { files } };
       },
       get: async ({ fileId, alt }: any, options?: any) => {
@@ -451,6 +461,7 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
         const item = googleBlobs.get(String(fileId));
         if (item) {
           if (requestBody?.name) item.name = requestBody.name;
+          if (typeof requestBody?.trashed === 'boolean') item.trashed = requestBody.trashed;
           if (addParents) item.parents = [addParents];
         }
         return { data: { id: fileId, parents: item?.parents || [] } };
@@ -1410,5 +1421,213 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     const html = await shareRes.text();
     assert.equal(html.includes('<script>alert(1)</script>'), false);
     assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+  });
+
+  // ── 47. Storage summary supports omitted/"all" accountId and populates Google/OneDrive categories ──
+  await t.test('47. /api/storage/summary supports omitted or "all" accountId and computes Google/OneDrive categories', async () => {
+    const gdRes = await apiFetch(`/api/storage/summary?accountId=${gdAccount1Id}`);
+    assert.equal(gdRes.status, 200);
+    const gdSummary: any = await gdRes.json();
+    assert.equal(gdSummary.accountType, 'google');
+    assert.equal(typeof gdSummary.fileCount, 'number');
+    assert.ok(gdSummary.fileCount >= 1);
+    assert.ok(gdSummary.categories);
+    assert.equal(typeof gdSummary.categories.documents, 'number');
+
+    const odRes = await apiFetch(`/api/storage/summary?accountId=${odAccount1Id}`);
+    assert.equal(odRes.status, 200);
+    const odSummary: any = await odRes.json();
+    assert.equal(odSummary.accountType, 'onedrive');
+    assert.equal(typeof odSummary.fileCount, 'number');
+    assert.ok(odSummary.categories);
+
+    const allRes1 = await apiFetch('/api/storage/summary');
+    assert.equal(allRes1.status, 200);
+    const allSummary1: any = await allRes1.json();
+    assert.equal(allSummary1.accountId, 'all');
+    assert.ok(allSummary1.usedBytes >= gdSummary.usedBytes + odSummary.usedBytes);
+    assert.ok(allSummary1.fileCount >= gdSummary.fileCount + odSummary.fileCount);
+    assert.ok(allSummary1.categories);
+
+    const allRes2 = await apiFetch('/api/storage/summary?accountId=all');
+    assert.equal(allRes2.status, 200);
+    const allSummary2: any = await allRes2.json();
+    assert.equal(allSummary2.usedBytes, allSummary1.usedBytes);
+  });
+
+  // ── 48. Trash soft-delete, list, restore, permanent delete, and expired sweep ──
+  await t.test('48. Soft-deletes files to Trash, hides from /api/files, restores, and permanently deletes', async () => {
+    const payload = Buffer.from('Trash lifecycle test file content');
+    const upRes = await uploadMultipart(String(tgAccount1Id), payload, 'trash-me.txt', {
+      fileName: 'trash-me.txt',
+      mimeType: 'text/plain',
+    });
+    assert.equal(upRes.status, 200);
+    const { fileId } = (await upRes.json()) as any;
+    assert.ok(fileId);
+
+    // Soft-delete (default DELETE /api/files/:fileId)
+    const delRes = await apiFetch(`/api/files/${fileId}?accountId=${tgAccount1Id}`, { method: 'DELETE' });
+    assert.equal(delRes.status, 200);
+    const delJson: any = await delRes.json();
+    assert.equal(delJson.trashed, true);
+
+    // Hidden from /api/files
+    const filesRes = await apiFetch(`/api/files?accountId=${tgAccount1Id}`);
+    const filesList: any[] = await filesRes.json();
+    assert.equal(filesList.some((f) => String(f.id) === String(fileId)), false);
+
+    // Appears in /api/trash
+    const trashRes = await apiFetch(`/api/trash?accountId=${tgAccount1Id}`);
+    assert.equal(trashRes.status, 200);
+    const trashList: any[] = await trashRes.json();
+    assert.equal(trashList.some((f) => String(f.id) === String(fileId)), true);
+
+    // Restore from trash
+    const restoreRes = await apiFetch('/api/trash/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: String(tgAccount1Id), fileId }),
+    });
+    assert.equal(restoreRes.status, 200);
+
+    // Back in /api/files
+    const filesAfterRestore: any[] = await (await apiFetch(`/api/files?accountId=${tgAccount1Id}`)).json();
+    assert.equal(filesAfterRestore.some((f) => String(f.id) === String(fileId)), true);
+
+    // Soft-delete again and permanently delete via DELETE /api/trash/:fileId
+    await apiFetch(`/api/files/${fileId}?accountId=${tgAccount1Id}`, { method: 'DELETE' });
+    const permRes = await apiFetch(`/api/trash/${fileId}?accountId=${tgAccount1Id}`, { method: 'DELETE' });
+    assert.equal(permRes.status, 200);
+    const trashAfterPerm: any[] = await (await apiFetch(`/api/trash?accountId=${tgAccount1Id}`)).json();
+    assert.equal(trashAfterPerm.some((f) => String(f.id) === String(fileId)), false);
+
+    // Expired 31-day old trash item is purged by sweepExpiredTrash()
+    const expiredInsert = await mockDb.collection('tg_files').insertOne({
+      accountId: tgAccount1Id,
+      messageId: 88888,
+      name: 'old-trashed.txt',
+      size: 10,
+      mimeType: 'text/plain',
+      trashed: true,
+      trashedAt: new Date(Date.now() - 31 * 24 * 60 * 60 * 1000),
+    });
+    const purgedCount = await sweepExpiredTrash();
+    assert.equal(purgedCount >= 1, true);
+    const checkExpired = await mockDb.collection('tg_files').findOne({ _id: expiredInsert.insertedId });
+    assert.equal(checkExpired, null);
+  });
+
+  // ── 49. Active Sessions listing, token non-exposure, revocation, and expiry enforcement ──
+  await t.test('49. Lists active sessions without exposing raw tokens, revokes sessions, and rejects expired sessions', async () => {
+    const sessTokenA = 'tok_session_device_a';
+    const sessTokenB = 'tok_session_device_b';
+    const expiredToken = 'tok_session_expired';
+
+    await mockDb.collection('sessions').insertOne({
+      sessionId: 'sess_dev_a',
+      token: sessTokenA,
+      userId: user1Id,
+      username: 'alice',
+      deviceName: 'Pixel 9 Pro',
+      userAgent: 'Cloudyte/Android',
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+      expiresAt: new Date(Date.now() + 7 * 86400 * 1000),
+    });
+    await mockDb.collection('sessions').insertOne({
+      sessionId: 'sess_dev_b',
+      token: sessTokenB,
+      userId: user1Id,
+      username: 'alice',
+      deviceName: 'Chrome Linux',
+      userAgent: 'Mozilla/5.0',
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+      expiresAt: new Date(Date.now() + 7 * 86400 * 1000),
+    });
+    await mockDb.collection('sessions').insertOne({
+      sessionId: 'sess_expired',
+      token: expiredToken,
+      userId: user1Id,
+      username: 'alice',
+      deviceName: 'Old Phone',
+      createdAt: new Date(Date.now() - 40 * 86400 * 1000),
+      lastActiveAt: new Date(Date.now() - 40 * 86400 * 1000),
+      expiresAt: new Date(Date.now() - 1000),
+    });
+
+    // Expired session token is rejected with 401
+    const expCheck = await fetch(`${baseUrl}/api/accounts`, {
+      headers: { Authorization: `Bearer ${expiredToken}` },
+    });
+    assert.equal(expCheck.status, 401);
+
+    // GET /api/sessions lists active sessions and never leaks raw token
+    const listRes = await fetch(`${baseUrl}/api/sessions`, {
+      headers: { Authorization: `Bearer ${sessTokenA}` },
+    });
+    assert.equal(listRes.status, 200);
+    const sessions: any[] = await listRes.json();
+    assert.ok(sessions.length >= 2);
+    for (const s of sessions) {
+      assert.equal(s.token, undefined);
+      assert.equal(typeof s.deviceName, 'string');
+    }
+    const currentSess = sessions.find((s) => s.id === 'sess_dev_a');
+    assert.ok(currentSess);
+    assert.equal(currentSess.isCurrent, true);
+
+    // Revoke single session B
+    const revRes = await fetch(`${baseUrl}/api/sessions/sess_dev_b`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${sessTokenA}` },
+    });
+    assert.equal(revRes.status, 200);
+    const bCheck = await fetch(`${baseUrl}/api/accounts`, {
+      headers: { Authorization: `Bearer ${sessTokenB}` },
+    });
+    assert.equal(bCheck.status, 401);
+  });
+
+  // ── 50. Async Cross-Account Transfer Job & SSE Progress Stream ──
+  await t.test('50. Streams real-time progress for async cross-account transfer jobs via SSE', async () => {
+    const payload = Buffer.from('Async SSE cross-account transfer payload');
+    const upRes = await uploadMultipart(String(tgAccount1Id), payload, 'sse-transfer.txt', {
+      fileName: 'sse-transfer.txt',
+      mimeType: 'text/plain',
+    });
+    assert.equal(upRes.status, 200);
+    const { fileId } = (await upRes.json()) as any;
+
+    const asyncCopyRes = await apiFetch('/api/files/copy?async=true', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId,
+        targetAccountId: String(gdAccount1Id),
+        targetFolderId: 'root',
+      }),
+    });
+    assert.equal(asyncCopyRes.status, 202);
+    const asyncCopyJson: any = await asyncCopyRes.json();
+    assert.equal(asyncCopyJson.async, true);
+    assert.ok(asyncCopyJson.jobId);
+
+    const sseRes = await apiFetch(`/api/jobs/${asyncCopyJson.jobId}/stream`);
+    assert.equal(sseRes.status, 200);
+    assert.ok(sseRes.headers.get('content-type')?.includes('text/event-stream'));
+    const sseText = await sseRes.text();
+    const events = sseText
+      .split('\n\n')
+      .map((chunk) => chunk.trim())
+      .filter((chunk) => chunk.startsWith('data: '))
+      .map((chunk) => JSON.parse(chunk.slice(6)));
+
+    assert.ok(events.length >= 1);
+    const finalEvent = events[events.length - 1];
+    assert.equal(finalEvent.status, 'completed');
+    assert.equal(finalEvent.progressPct, 100);
   });
 });
