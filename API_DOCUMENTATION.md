@@ -43,6 +43,19 @@ Authorization: Basic <base64(admin_username:admin_password)>
 
 New server-level, upload, and rate-limit errors retain the existing string `error` field for compatibility and also include a stable `code` and `requestId` where available. Uploads are rejected with `507 INSUFFICIENT_STORAGE` when the server temporary directory does not have the configured free-space reserve. Provider uploads and cross-account transfers are bounded by per-account concurrency limits to prevent upstream overload.
 
+### 3.0 Standard Error Response Format
+Every error response across all routes follows a consistent JSON envelope:
+```json
+{
+  "error": "Human-readable message",
+  "code": "MACHINE_READABLE_CODE",
+  "requestId": "e559cb22-a7b2-4b5c-b2ed-7425a501c252",
+  "retryable": true
+}
+```
+- **Standard Error Codes:** `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `RATE_LIMITED`, `PROVIDER_ERROR`, `UPLOAD_FAILED`, `TRANSFER_FAILED`, `INSUFFICIENT_STORAGE`, `INTERNAL_ERROR` (plus domain-specific E2EE/session codes listed in Section 11.7).
+- **Request Tracing:** Every HTTP response includes an `X-Request-Id` header matching `requestId`. Clients may also supply their own `X-Request-Id` header for end-to-end correlation.
+
 ### 3.1 Health Check
 Liveness and uptime monitor.
 - **Method & Route:** `GET /healthz`
@@ -50,18 +63,26 @@ Liveness and uptime monitor.
 - **Response (200 OK):**
   ```json
   {
-    "ok": true
+    "ok": true,
+    "uptimeSec": 3600
   }
   ```
 
 ### 3.1.1 Readiness Check
-Deployment readiness monitor. Returns `200` only after MongoDB initialization has completed; otherwise returns `503`.
+Deployment readiness monitor. Returns `200` only when the server is not shutting down, MongoDB is connected, and temporary disk headroom (`MIN_TEMP_FREE_BYTES`) is available; otherwise returns `503`.
 - **Method & Route:** `GET /readyz`
 - **Auth Required:** No
+- **Response (200 OK):**
+  ```json
+  {
+    "ok": true,
+    "status": "ready",
+    "mongo": true,
+    "diskHeadroom": true
+  }
+  ```
 
-All responses include an `X-Request-ID` header. Include that ID when reporting an error so the corresponding server log entry can be located.
-
-For large cross-account transfers, clients can opt into durable processing with `?async=true`. The server returns `202 Accepted` and a job ID; the job survives process restarts because it is stored in MongoDB.
+For large cross-account transfers and multi-file backups, clients can opt into durable background processing (`?async=true` on `/api/files/move` and `/api/files/copy`, or `POST /api/backups/batch`). The server returns `202 Accepted` and a job ID; jobs are leased, heartbeated, and persisted in MongoDB.
 
 ### 3.2 Get Public Settings
 Returns the global registration policy.
@@ -127,6 +148,14 @@ Terminates and invalidates the session token in the database.
     "success": true
   }
   ```
+
+### 3.6 Active Device Sessions & Sliding Expiry
+List or revoke active login sessions for the authenticated user (raw tokens are never returned).
+- **Sliding Session Expiry:** Sessions default to a 30-day TTL (`expiresAt`) and automatically slide forward by 30 days whenever the user is active (throttled to once every 5 minutes in both memory cache and MongoDB).
+- **List Sessions:** `GET /api/sessions`
+  - **Response (200 OK):** Array of `{ sessionId, userAgent, ip, createdAt, lastActiveAt, expiresAt, isCurrent }`.
+- **Revoke Session:** `DELETE /api/sessions/:sessionId`
+  - **Response (200 OK):** `{ "success": true }`
 
 ---
 
@@ -486,14 +515,18 @@ Creates a new directory in the selected drive.
   ```
 - **Response (200 OK):** `{ "success": true }`
 
-### 6.4 Upload File
-Uploads a file to a specific storage drive and destination folder using disk-streamed storage (supports files up to 2 GB with zero RAM buffering).
+### 6.4 Upload File & Resumable Upload Sessions
+Uploads a file to a specific storage drive and destination folder using disk-streamed staging in `TEMP_DIR` (supports files up to 2 GB with zero RAM buffering, per-user concurrency limits, daily upload byte quotas, and `Idempotency-Key` deduplication).
+
+#### 6.4.1 Direct Multipart Upload (`POST /api/upload/:accountId`)
 - **Method & Route:** `POST /api/upload/:accountId`
 - **Auth Required:** Yes
+- **Headers:** `Idempotency-Key: <unique-key>` *(Optional, recommended for safe retries)*
 - **Content-Type:** `multipart/form-data`
 - **Form Fields:**
   - `file`: Binary file data.
   - `folderId`: Target folder ID (or `"root"`).
+  - `idempotencyKey`: Optional idempotency key if not passed via header.
 - **Response (200 OK):**
   ```json
   {
@@ -501,17 +534,37 @@ Uploads a file to a specific storage drive and destination folder using disk-str
   }
   ```
 
-### 6.5 Download or Stream File
+#### 6.4.2 Resumable / Chunked Upload Sessions (`/api/upload-sessions/*`)
+Recommended for large files and interrupted networks:
+1. **Create Session:** `POST /api/upload-sessions/:accountId`
+   - **Headers:** `Idempotency-Key: <key>` *(Optional if passed in JSON body)*
+   - **Body (JSON):** `{ "fileName": "video.mp4", "mimeType": "video/mp4", "totalBytes": 104857600, "chunkSize": 2097152, "folderId": "root", "checksum": "<optional-sha256-hex>", "idempotencyKey": "<key>" }` *(Note: `size` and `desiredChunkSize` are also accepted as aliases for `totalBytes` and `chunkSize`)*.
+   - **Response (`201 Created` or `200 OK` on idempotent replay):** Returns session descriptor `{ sessionId, status: "active", receivedBytes, totalBytes, chunkSize, expiresAt, ... }`.
+2. **Inspect Session State:** `GET /api/upload-sessions/:sessionId`
+   - Returns current `status` (`active`, `paused`, `completing`, `completed`, `expired`, `cancelled`), `receivedBytes`, and `totalBytes`.
+3. **Upload Chunk (Zero-Double-Write Direct Stream or Multipart):** `PUT /api/upload-sessions/:sessionId/chunks`
+   - **Recommended Direct Stream Mode (`Content-Type: application/octet-stream`):** Send raw chunk bytes in the request body with `X-Chunk-Offset: <byte_offset>` (or `Content-Range: bytes <start>-<end>/<total>`) and `Content-Length`. Streams directly into `session.tempPath` while computing SHA-256 on the fly with zero intermediate Multer disk write.
+   - **Multipart Mode (`Content-Type: multipart/form-data`):** Send `chunk` binary field + `offset` form field (or `X-Chunk-Offset` / `Content-Range` header).
+   - **Response (`200 OK`):** `{ sessionId, receivedBytes, totalBytes, nextOffset, complete }`. Returns `409 UPLOAD_SESSION_NOT_ACTIVE` if paused, `409 UPLOAD_SESSION_OFFSET_CONFLICT` on mismatched offset, or `410 UPLOAD_SESSION_EXPIRED` if expired. Exact chunk replays with matching SHA-256 are acknowledged idempotently (`200 OK`).
+4. **Pause Session:** `POST /api/upload-sessions/:sessionId/pause`
+   - Transitions an `active` session to `paused` (`200 OK`).
+5. **Resume Session:** `POST /api/upload-sessions/:sessionId/resume`
+   - Transitions a `paused` session back to `active` (`200 OK`).
+6. **Complete Session:** `POST /api/upload-sessions/:sessionId/complete`
+   - Acquires a completion lease lock, verifies received byte size and SHA-256 checksum, streams the staged file to the target provider (persisting upstream OneDrive `nextExpectedRanges` or Google Drive resumable upload URIs), and cleans up temporary staging files.
+7. **Cancel Session:** `DELETE /api/upload-sessions/:sessionId` (or `POST /api/upload-sessions/:sessionId/cancel`)
+   - Marks the session `cancelled` and immediately unlinks staged temp files.
+
+### 6.5 Download or Stream File (`GET` & `HEAD`)
 Streams or downloads a file from any linked drive (Telegram, Google Drive, OneDrive).
-- **Method & Route:** `GET /api/download/:accountId/:fileId`
+- **Method & Route:** `GET /api/download/:accountId/:fileId` and `HEAD /api/download/:accountId/:fileId`
 - **Auth Required:** Yes (`Authorization` header or `?token=<session_token>`)
 - **Query Parameters:**
-  - `preview=1` *(Optional)*: Sets `Content-Disposition: inline` instead of `attachment`, enabling in-app preview for images, PDFs, and video playback. Sends `Cache-Control: private, max-age=86400`.
+  - `preview=1` *(Optional)*: Sets `Content-Disposition: inline` instead of `attachment`, enabling in-app preview for images, PDFs, and video playback.
 - **Headers & Streaming:**
-  - Always sends `Accept-Ranges: bytes`.
-  - Content-Disposition uses RFC 5987 standard: `filename*=UTF-8''<encoded_name>`.
-  - For Telegram Drive: builds ETag `"${meta._id}-${meta.size}"` and returns `304 Not Modified` before contacting Telegram if `If-None-Match` matches.
-  - Automatically aborts downloads on client disconnect (`res.on('close')`) and respects stream backpressure (`drain`).
+  - Always sends `Accept-Ranges: bytes`, `Cache-Control: private, no-cache` (never cached publicly), `Content-Type`, `Content-Length`, `ETag`, and RFC 5987 `Content-Disposition: filename*=UTF-8''<encoded_name>`.
+  - Supports `HEAD` requests to inspect file size, MIME type, and ETag before downloading bytes.
+  - Enforces per-user concurrent download limits (`MAX_CONCURRENT_DOWNLOADS_PER_USER`) and idle-stream timeouts (`DOWNLOAD_IDLE_TIMEOUT_MS`), destroying upstream provider streams immediately on client disconnect.
 
 ### 6.6 Rename File
 Renames an existing file or folder.
@@ -525,11 +578,18 @@ Renames an existing file or folder.
   ```
 - **Response (200 OK):** `{ "success": true }`
 
-### 6.7 Delete File
-Permanently removes a file or folder and purges any associated cached thumbnails.
-- **Method & Route:** `DELETE /api/files/:fileId?accountId=:accountId`
-- **Auth Required:** Yes
-- **Response (200 OK):** `{ "success": true }`
+### 6.7 Delete & Trash / Restore Operations (Telegram Drive, Google Drive & OneDrive)
+- **Soft-Delete / Move to Trash:** `DELETE /api/files/:fileId?accountId=:accountId`
+  - Soft-deletes the item into the drive's Trash across all three providers (`tgdrive`, `google`, and `onedrive`) and hides it from `GET /api/files`. Pass `?permanent=true` to bypass Trash and permanently delete immediately.
+- **List Trash:** `GET /api/trash?accountId=:accountId`
+  - Lists trashed items for a specific drive (`accountId=<id>`) or across all linked drives (`accountId=all` or omitted). For OneDrive, merges tracked trashed items with Microsoft Graph Recycle Bin (`/me/drive/special/recyclebin/children`).
+- **Restore from Trash:** `POST /api/trash/restore`
+  - **Body (JSON):** `{ "accountId": "<id>", "fileId": "<id>" }`
+  - Restores the file in Telegram Drive, Google Drive (`trashed: false`), or OneDrive (`/me/drive/items/:id/restore`) and invalidates the drive cache.
+- **Permanently Delete Single Item from Trash:** `DELETE /api/trash/:fileId?accountId=:accountId`
+  - Permanently removes the file from the provider and revokes the backing Telegram channel message when no references remain.
+- **Empty Trash (Per-Drive or All Drives):** `DELETE /api/trash?accountId=:accountId`
+  - Permanently deletes all trashed items in the specified drive (or all linked drives if `accountId=all`). Returns `{ "success": true, "deletedCount": <number> }`.
 
 ---
 
@@ -619,11 +679,38 @@ Duplicates a file in the destination directory or clones it across different sto
 
 ---
 
-### 7.3 Durable Job Status
-- **Method & Route:** `GET /api/jobs/:jobId`
-- **Auth Required:** Yes
-- **Response:** `{ "id": "...", "type": "cross_account_transfer", "status": "queued|running|completed|failed", "attempts": 1 }`
-- **Retry:** `POST /api/jobs/:jobId/retry` retries a failed job owned by the authenticated user.
+### 7.3 Durable Background Jobs (`GET /api/jobs*`, `POST /api/jobs/:jobId/*`)
+- **Concurrent Worker Pool:** Processed by up to `MAX_CONCURRENT_JOBS` (default `3`) parallel background workers with atomic MongoDB lease locks (`leaseUntil`, `leaseOwner`) and per-account-pair serialization (`providerLimit("transfer:source:target", 1)`).
+- **List Jobs:** `GET /api/jobs?status=<optional_status>`
+  - Returns the authenticated user's recent background transfer and backup jobs.
+- **Get Job Status:** `GET /api/jobs/:jobId`
+  - **Response:** `{ "id": "...", "type": "cross_account_transfer|batch_backup|batch_restore", "status": "queued|running|completed|failed|cancelled", "stage": "...", "progressPct": 100, "bytesProcessed": 1024, "totalBytes": 1024, "attempts": 1, "maxAttempts": 3, "deadLettered": false }`
+- **Real-Time Job Progress Stream (SSE):** `GET /api/jobs/:jobId/stream`
+  - Streams Server-Sent Events (`text/event-stream`) as job `stage` and `progressPct` advance until completion, failure, or cancellation.
+- **Cancel Job:** `POST /api/jobs/:jobId/cancel`
+  - Cooperatively cancels a `queued` or `running` job, aborts in-flight transfers, and guarantees the source file is never deleted on a cancelled move.
+- **Retry Failed / Cancelled Job:** `POST /api/jobs/:jobId/retry`
+  - Resets `status` to `queued` and clears dead-letter flags so the worker re-processes the job idempotently.
+
+### 7.4 Multi-File Batch Backup, Verification, and Conflict-Safe Restore (`/api/backups/*`)
+- **Enqueue Batch Backup:** `POST /api/backups/batch`
+  - **Request Body (JSON):**
+    ```json
+    {
+      "sourceAccountId": "65d8a1f2e4b0111111111111",
+      "targetAccountId": "65d8a1f2e4b0222222222222",
+      "targetFolderId": "root",
+      "fileIds": ["65d8a2b5e4b0222222222222", "65d8a2b5e4b0333333333333"],
+      "conflictStrategy": "rename"
+    }
+    ```
+  - **Behavior:** Runs in the background job queue (`202 Accepted` with `jobId`). Isolates partial failures so a single failed file is recorded in `manifest.failedFiles` while remaining files complete (`completed_with_errors`). Writes a recovery manifest in `transfer_manifests`.
+- **Verify Backup Manifest:** `POST /api/backups/:jobId/verify`
+  - Verifies that all backed-up files exist in the target account and match expected byte sizes.
+  - **Response (200 OK):** `{ "jobId": "...", "verified": true, "totalItems": 2, "verifiedCount": 2, "failedVerifications": [], "verifiedAt": "..." }`
+- **Restore Backup (Non-Destructive Conflict Copies):** `POST /api/backups/:jobId/restore`
+  - **Request Body (JSON):** `{ "targetAccountId": "...", "targetFolderId": "root", "conflictStrategy": "rename" }`
+  - **Behavior:** Restores completed backup items as a `batch_restore` background job (`202 Accepted`). Defaults to `conflictStrategy: "rename"` so existing destination files are **never silently overwritten** (conflicting filenames are saved as `<name> (conflict copy).<ext>`).
 
 ## 8. Public Share Links
 
@@ -700,32 +787,65 @@ Permanently deletes the user and all their linked accounts and file references.
   ```
 - **Response:** `{ "success": true }`
 
+### 9.8 Get System & Provider Observability Metrics
+Returns real-time process health, CPU, memory, event-loop lag, open file descriptors, active connections/uploads/downloads, temp/thumb disk usage, job queue depth, dead-letter job counts, cache hit/miss stats, per-provider call telemetry, and active threshold alerts.
+- **Method & Route:** `GET /api/admin/metrics`
+- **Auth Required:** Admin session or Admin Basic Auth
+- **Response (200 OK):**
+  ```json
+  {
+    "uptimeSeconds": 1420,
+    "activeConnections": 2,
+    "eventLoopLagMs": 1.4,
+    "openFileDescriptors": 42,
+    "memoryUsage": { "rss": 98566144, "heapTotal": 45088768, "heapUsed": 32112640 },
+    "disk": { "tempFreeHeadroomOk": true, "tempDirBytes": 0, "tempFileCount": 0, "thumbDirBytes": 1245184 },
+    "uploads": { "activeGlobal": 0, "completed": 15, "failed": 0 },
+    "downloads": { "activeGlobal": 0 },
+    "jobs": { "queued": 0, "running": 0, "failed": 0, "deadLetter": 0, "transfersCompleted": 8, "transfersFailed": 0 },
+    "cache": { "driveCacheKeys": 14, "authCacheKeys": 3 },
+    "providers": {
+      "google": { "calls": 24, "errors": 0, "retries": 1, "totalDurationMs": 3120 },
+      "onedrive": { "calls": 10, "errors": 0, "retries": 0, "totalDurationMs": 1450 },
+      "telegram": { "calls": 40, "errors": 0, "retries": 0, "totalDurationMs": 980 }
+    },
+    "alerts": []
+  }
+  ```
+
 ---
 
 ## 10. Android & Mobile Developer Quick Reference
 
 | Feature | Endpoint | HTTP Method | Auth | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| **Health Check** | `/healthz` | GET | None | Liveness check returns `{ "ok": true }` |
+| **Health Check** | `/healthz` | GET | None | Liveness check returns `{ "ok": true, "uptimeSec": ... }` |
+| **Readiness Check** | `/readyz` | GET | None | Checks MongoDB connectivity and temp disk headroom |
 | **Login** | `/api/login` | POST | None | Rate limited (10/min); returns Bearer `token` |
 | **Register** | `/api/register` | POST | None | Rate limited (10/min) |
+| **Active Sessions** | `/api/sessions` | GET / DELETE | Bearer | List or revoke active device sessions |
 | **List Drives** | `/api/accounts` | GET | Bearer | Returns all linked drives |
-| **Storage Summary** | `/api/storage/summary` | GET | Bearer | Pass `?accountId=<id>`; returns `usedBytes`, `totalBytes`, `fileCount`, `categories` |
+| **Storage Summary** | `/api/storage/summary` | GET | Bearer | Pass `?accountId=<id>` or `all`; returns `usedBytes`, `totalBytes`, `fileCount`, `categories` |
 | **Google OAuth** | `/api/auth/drive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **OneDrive OAuth** | `/api/auth/onedrive-link` | GET | Bearer | Open returned `url` in Chrome Custom Tabs |
 | **Add TG Drive** | `/api/tgdrive/register` | POST | Bearer | Pass `channelId` and `driveName` |
 | **List Files** | `/api/files` | GET | Bearer | Supports `cursor`, `limit`, weak ETag 304, returns `sizeBytes`, `updatedAt` & `thumbUrl` |
 | **Thumbnail** | `/api/thumb/:accId/:fileId` | GET | Bearer or `?token=` | Optimized image/video thumbnail, `?s=256` |
 | **Create Folder** | `/api/folders` | POST | Bearer | Pass `name` & `parentId` |
-| **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` (disk-streamed up to 2GB) |
-| **Download/Stream** | `/api/download/:accId/:fileId`| GET | Bearer or `?token=` | Supports `Range`, RFC 5987, ETag 304, and `?preview=1` |
-| **Move File** | `/api/files/move` | POST | Bearer | Supports same-drive & cross-drive transfers |
-| **Copy File** | `/api/files/copy` | POST | Bearer | Supports same-drive & cross-drive cloning |
+| **Upload File** | `/api/upload/:accountId` | POST | Bearer | Multipart Form: `file` & `folderId` + `Idempotency-Key` |
+| **Upload Sessions** | `/api/upload-sessions/:accId` | POST / PUT / GET / DELETE | Bearer | Resumable chunked uploads with `/pause`, `/resume`, `/complete`, `/cancel` |
+| **Download/Stream** | `/api/download/:accId/:fileId`| GET / HEAD | Bearer or `?token=` | Supports `Range`, `HEAD`, RFC 5987, ETag 304, and `?preview=1` |
+| **Trash Management** | `/api/trash` | GET / POST / DELETE | Bearer | List trashed files, `/api/trash/restore`, or permanent delete |
+| **Move File** | `/api/files/move` | POST | Bearer | Supports same-drive & cross-drive transfers (`?async=true` for job queue) |
+| **Copy File** | `/api/files/copy` | POST | Bearer | Supports same-drive & cross-drive cloning (`?async=true` for job queue) |
+| **Jobs Queue** | `/api/jobs` | GET / POST | Bearer | Inspect jobs, SSE `/stream`, `/cancel`, and `/retry` |
+| **Batch Backups** | `/api/backups/batch` | POST | Bearer | Background batch backup, `/:jobId/verify`, and conflict-safe `/:jobId/restore` |
 | **Share Link** | `/api/share` | POST | Bearer | Returns public URL `/s/:shareId` (`409` for encrypted files) |
 | **Public Download**| `/api/public/download/:shareId`| GET | None | Direct file download (`409` for encrypted files) |
 | **Put Key Backup** | `/api/accounts/:id/encryption/key-backup` | PUT | Bearer | Store opaque PBKDF2-wrapped encryption key backup |
 | **Get Key Backup** | `/api/accounts/:id/encryption/key-backup` | GET | Bearer | Retrieve opaque wrapped encryption key backup |
 | **Delete Key Backup**| `/api/accounts/:id/encryption/key-backup` | DELETE | Bearer | Delete stored key backup (`204 No Content`) |
+| **Admin Metrics** | `/api/admin/metrics` | GET | Admin | Full process, disk, provider, queue, and alert telemetry |
 
 ---
 

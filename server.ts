@@ -76,27 +76,191 @@ function timingSafeEqualStrings(a: string, b: string): boolean {
 const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
 const MICROSOFT_CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET;
 const MICROSOFT_REDIRECT_URI = `${process.env.APP_URL}/auth/microsoft/callback`;
-const MEDIA_SIGNING_SECRET = process.env.MEDIA_SIGNING_SECRET || crypto.randomBytes(32).toString('hex');
-if (isProduction && !process.env.MEDIA_SIGNING_SECRET) {
-  throw new Error('MEDIA_SIGNING_SECRET is required in production');
-}
+const MEDIA_SIGNING_SECRET = process.env.MEDIA_SIGNING_SECRET || (
+  (ADMIN_PASSWORD || process.env.MONGODB_URI || process.env.TELEGRAM_BOT_TOKEN)
+    ? crypto.createHash('sha256').update(`cloudyte-media-sig:${ADMIN_PASSWORD}:${process.env.MONGODB_URI || ''}:${process.env.TELEGRAM_BOT_TOKEN || ''}`).digest('hex')
+    : crypto.randomBytes(32).toString('hex')
+);
 const JOB_MAX_ATTEMPTS = Number(process.env.JOB_MAX_ATTEMPTS || 3);
 const JOB_LEASE_MS = 10 * 60 * 1000;
 
 const API_ID = Number(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
 
-// ─── Thumbnail & Disk Cache Configuration ─────────────────────────────────────
+// ─── Thumbnail, Dedicated Temp Dir & Resource Protection Configuration ───────
 const THUMB_DIR = process.env.THUMB_DIR || path.join(os.tmpdir(), 'cloudyte-thumbs');
-if (!fs.existsSync(THUMB_DIR)) {
-  try { fs.mkdirSync(THUMB_DIR, { recursive: true }); } catch { /* ignore */ }
+const TEMP_DIR  = process.env.TEMP_DIR || path.join(os.tmpdir(), 'cloudyte-temp');
+for (const dir of [THUMB_DIR, TEMP_DIR]) {
+  if (!fs.existsSync(dir)) {
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+  }
 }
+
+const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 15_000);
+const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS || 3_000);
+const PROVIDER_API_TIMEOUT_MS = Number(process.env.PROVIDER_API_TIMEOUT_MS || 30_000);
+const DOWNLOAD_IDLE_TIMEOUT_MS = Number(process.env.DOWNLOAD_IDLE_TIMEOUT_MS || 60_000);
+const MAX_CONCURRENT_UPLOADS_PER_USER = Number(process.env.MAX_CONCURRENT_UPLOADS_PER_USER || 5);
+const MAX_GLOBAL_CONCURRENT_UPLOADS = Number(process.env.MAX_GLOBAL_CONCURRENT_UPLOADS || 25);
+const MAX_DAILY_UPLOAD_BYTES_PER_USER = Number(process.env.MAX_DAILY_UPLOAD_BYTES_PER_USER || 20 * 1024 * 1024 * 1024);
+const MAX_CONCURRENT_DOWNLOADS_PER_USER = Number(process.env.MAX_CONCURRENT_DOWNLOADS_PER_USER || 10);
+const MAX_JOB_QUEUE_DEPTH = Number(process.env.MAX_JOB_QUEUE_DEPTH || 500);
+const WORKER_ID = `worker_${process.pid}_${ crypto.randomBytes(4).toString('hex') }`;
 
 const thumbLimit = pLimit(10);
 const inFlightThumbs = new Map<string, Promise<string | null>>();
+const inFlightCacheLoads = new Map<string, Promise<any>>();
 const providerLimits = new Map<string, ReturnType<typeof pLimit>>();
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const MIN_TEMP_FREE_BYTES = Number(process.env.MIN_TEMP_FREE_BYTES || 5 * 1024 * 1024 * 1024);
+
+// Active resource concurrency tracking
+const activeUploadsByUser = new Map<string, number>();
+let activeGlobalUploads = 0;
+const activeDownloadsByUser = new Map<string, number>();
+let activeHttpConnections = 0;
+let isShuttingDown = false;
+
+export const STANDARD_ERROR_CODES = {
+  BAD_REQUEST: 'BAD_REQUEST',
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
+  NOT_FOUND: 'NOT_FOUND',
+  CONFLICT: 'CONFLICT',
+  RATE_LIMITED: 'RATE_LIMITED',
+  PROVIDER_ERROR: 'PROVIDER_ERROR',
+  UPLOAD_FAILED: 'UPLOAD_FAILED',
+  TRANSFER_FAILED: 'TRANSFER_FAILED',
+  INSUFFICIENT_STORAGE: 'INSUFFICIENT_STORAGE',
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+} as const;
+
+type ProviderMetricBucket = {
+  calls: number;
+  errors: number;
+  consecutiveFailures: number;
+  retries: number;
+  totalDurationMs: number;
+  lastErrorAt: number | null;
+};
+
+const systemMetrics = {
+  startedAt: Date.now(),
+  requestsTotal: 0,
+  errorsTotal: 0,
+  slowRequestsTotal: 0,
+  unhandledRejections: 0,
+  uncaughtExceptions: 0,
+  uploadsCompleted: 0,
+  uploadsFailed: 0,
+  transfersCompleted: 0,
+  transfersFailed: 0,
+  jobsDeadLettered: 0,
+  eventLoopLagMs: 0,
+  mongoConnected: false,
+  mongoReconnects: 0,
+  providerCalls: {
+    google: { calls: 0, errors: 0, consecutiveFailures: 0, retries: 0, totalDurationMs: 0, lastErrorAt: null } as ProviderMetricBucket,
+    onedrive: { calls: 0, errors: 0, consecutiveFailures: 0, retries: 0, totalDurationMs: 0, lastErrorAt: null } as ProviderMetricBucket,
+    telegram: { calls: 0, errors: 0, consecutiveFailures: 0, retries: 0, totalDurationMs: 0, lastErrorAt: null } as ProviderMetricBucket,
+  } as Record<string, ProviderMetricBucket>,
+};
+
+function recordProviderCall(provider: string, operation: string, durationMs: number, ok: boolean, retryCount = 0, statusOrCode?: string | number) {
+  const key = provider.toLowerCase().includes('one') ? 'onedrive' : provider.toLowerCase().includes('tg') || provider.toLowerCase().includes('tele') ? 'telegram' : 'google';
+  const bucket = systemMetrics.providerCalls[key] || (systemMetrics.providerCalls[key] = { calls: 0, errors: 0, consecutiveFailures: 0, retries: 0, totalDurationMs: 0, lastErrorAt: null });
+  bucket.calls++;
+  bucket.retries += retryCount;
+  bucket.totalDurationMs += durationMs;
+  if (!ok) {
+    bucket.errors++;
+    bucket.consecutiveFailures++;
+    bucket.lastErrorAt = Date.now();
+  } else {
+    bucket.consecutiveFailures = 0;
+  }
+  console.log(JSON.stringify({
+    event: 'provider_call',
+    provider: key,
+    operation,
+    durationMs,
+    status: ok ? 'ok' : 'error',
+    retryCount,
+    ...(statusOrCode !== undefined ? { providerStatus: statusOrCode } : {}),
+  }));
+}
+
+function getOpenFileDescriptorCount(): number | null {
+  try {
+    if (fs.existsSync('/proc/self/fd')) {
+      return fs.readdirSync('/proc/self/fd').length;
+    }
+  } catch { /* ignore on non-Linux */ }
+  return null;
+}
+
+function getTempDirStats(dir = TEMP_DIR): { fileCount: number; totalBytes: number } {
+  let fileCount = 0;
+  let totalBytes = 0;
+  try {
+    if (!fs.existsSync(dir)) return { fileCount: 0, totalBytes: 0 };
+    for (const name of fs.readdirSync(dir)) {
+      try {
+        const st = fs.statSync(path.join(dir, name));
+        if (st.isFile()) {
+          fileCount++;
+          totalBytes += st.size;
+        }
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+  return { fileCount, totalBytes };
+}
+
+function acquireUserUploadSlot(userId: string): { ok: boolean; reason?: string; release: () => void } {
+  const key = String(userId || 'anonymous');
+  const currentUser = activeUploadsByUser.get(key) || 0;
+  if (currentUser >= MAX_CONCURRENT_UPLOADS_PER_USER) {
+    return { ok: false, reason: `Maximum concurrent uploads per user (${MAX_CONCURRENT_UPLOADS_PER_USER}) exceeded`, release: () => {} };
+  }
+  if (activeGlobalUploads >= MAX_GLOBAL_CONCURRENT_UPLOADS) {
+    return { ok: false, reason: 'Server upload capacity is currently full; please retry shortly', release: () => {} };
+  }
+  activeUploadsByUser.set(key, currentUser + 1);
+  activeGlobalUploads++;
+  let released = false;
+  return {
+    ok: true,
+    release: () => {
+      if (released) return;
+      released = true;
+      activeGlobalUploads = Math.max(0, activeGlobalUploads - 1);
+      const cur = activeUploadsByUser.get(key) || 1;
+      if (cur <= 1) activeUploadsByUser.delete(key);
+      else activeUploadsByUser.set(key, cur - 1);
+    },
+  };
+}
+
+function acquireUserDownloadSlot(userId: string): { ok: boolean; release: () => void } {
+  const key = String(userId || 'anonymous');
+  const current = activeDownloadsByUser.get(key) || 0;
+  if (current >= MAX_CONCURRENT_DOWNLOADS_PER_USER) {
+    return { ok: false, release: () => {} };
+  }
+  activeDownloadsByUser.set(key, current + 1);
+  let released = false;
+  return {
+    ok: true,
+    release: () => {
+      if (released) return;
+      released = true;
+      const cur = activeDownloadsByUser.get(key) || 1;
+      if (cur <= 1) activeDownloadsByUser.delete(key);
+      else activeDownloadsByUser.set(key, cur - 1);
+    },
+  };
+}
 
 function providerLimit(key: string, concurrency = 3) {
   const normalizedKey = key || 'unknown';
@@ -109,6 +273,12 @@ function providerLimit(key: string, concurrency = 3) {
 }
 
 function apiError(res: any, status: number, code: string, message: string, requestId?: string, retryable = status >= 500 || status === 429) {
+  if (res?.locals) {
+    res.locals.errorCode = code;
+  }
+  if (status >= 500) {
+    systemMetrics.errorsTotal++;
+  }
   return res.status(status).json({
     error: message,
     code,
@@ -119,19 +289,21 @@ function apiError(res: any, status: number, code: string, message: string, reque
 }
 
 function errorCode(status: number) {
-  if (status === 400) return 'BAD_REQUEST';
-  if (status === 401) return 'AUTH_REQUIRED';
-  if (status === 403) return 'ACCOUNT_ACCESS_DENIED';
-  if (status === 404) return 'NOT_FOUND';
-  if (status === 409) return 'CONFLICT';
-  if (status === 429) return 'RATE_LIMITED';
-  if (status === 507) return 'INSUFFICIENT_STORAGE';
-  return 'INTERNAL_ERROR';
+  if (status === 400) return STANDARD_ERROR_CODES.BAD_REQUEST;
+  if (status === 401) return STANDARD_ERROR_CODES.UNAUTHORIZED;
+  if (status === 403) return STANDARD_ERROR_CODES.FORBIDDEN;
+  if (status === 404) return STANDARD_ERROR_CODES.NOT_FOUND;
+  if (status === 409) return STANDARD_ERROR_CODES.CONFLICT;
+  if (status === 429) return STANDARD_ERROR_CODES.RATE_LIMITED;
+  if (status === 502 || status === 503 || status === 504) return STANDARD_ERROR_CODES.PROVIDER_ERROR;
+  if (status === 507) return STANDARD_ERROR_CODES.INSUFFICIENT_STORAGE;
+  return STANDARD_ERROR_CODES.INTERNAL_ERROR;
 }
 
-function getFreeBytes(dir = os.tmpdir()) {
+function getFreeBytes(dir = TEMP_DIR) {
   try {
-    const stat = fs.statfsSync(dir);
+    const target = fs.existsSync(dir) ? dir : os.tmpdir();
+    const stat = fs.statfsSync(target);
     return Number(stat.bavail) * Number(stat.bsize);
   } catch {
     return null;
@@ -139,7 +311,7 @@ function getFreeBytes(dir = os.tmpdir()) {
 }
 
 function hasTempDiskHeadroom(requiredBytes = 0) {
-  const freeBytes = getFreeBytes();
+  const freeBytes = getFreeBytes(TEMP_DIR);
   return freeBytes === null || freeBytes - requiredBytes >= MIN_TEMP_FREE_BYTES;
 }
 
@@ -161,19 +333,23 @@ function isValidMediaRequest(accountId: string, fileId: string, expiresAt: strin
 const TEMP_FILE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const TEMP_FILE_PREFIXES = ['upload_', 'transfer_'];
 
-function pruneTempFiles(dir = os.tmpdir()) {
+function pruneTempFiles(dir = TEMP_DIR) {
   const cutoff = Date.now() - TEMP_FILE_MAX_AGE_MS;
-  try {
-    for (const name of fs.readdirSync(dir)) {
-      if (!TEMP_FILE_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
-      const fullPath = path.join(dir, name);
-      try {
-        const stat = fs.statSync(fullPath);
-        if (stat.isFile() && stat.mtimeMs < cutoff) fs.unlinkSync(fullPath);
-      } catch { /* another request may have removed or be using the file */ }
+  const dirsToSweep = dir === TEMP_DIR ? [TEMP_DIR, os.tmpdir()] : [dir];
+  for (const targetDir of dirsToSweep) {
+    try {
+      if (!fs.existsSync(targetDir)) continue;
+      for (const name of fs.readdirSync(targetDir)) {
+        if (!TEMP_FILE_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+        const fullPath = path.join(targetDir, name);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.isFile() && stat.mtimeMs < cutoff) fs.unlinkSync(fullPath);
+        } catch { /* another request may have removed or be using the file */ }
+      }
+    } catch (err) {
+      console.error('[TempFiles] Cleanup error:', err);
     }
-  } catch (err) {
-    console.error('[TempFiles] Cleanup error:', err);
   }
 }
 
@@ -241,9 +417,19 @@ function deleteThumbFiles(fileId: string, accountId?: string) {
   }
 }
 
-// ─── Caches ───────────────────────────────────────────────────────────────────
-const driveCache = new NodeCache({ stdTTL: 60, checkperiod: 120, useClones: false }); // 60s cache for drive listings
-const authCache  = new NodeCache({ stdTTL: 60, checkperiod: 120, useClones: false }); // 60s cache for token -> user auth
+// ─── Caches (bounded size, never mutate directly, stampede protected) ─────────
+const driveCache = new NodeCache({ stdTTL: 60, checkperiod: 120, maxKeys: 5000, useClones: true });
+const authCache  = new NodeCache({ stdTTL: 60, checkperiod: 120, maxKeys: 5000, useClones: true });
+
+async function withCacheStampedeProtection<T>(cacheKey: string, loader: () => Promise<T>): Promise<T> {
+  const existing = inFlightCacheLoads.get(cacheKey);
+  if (existing) return existing as Promise<T>;
+  const promise = loader().finally(() => {
+    inFlightCacheLoads.delete(cacheKey);
+  });
+  inFlightCacheLoads.set(cacheKey, promise);
+  return promise;
+}
 
 function invalidateDriveCache(accountId: string) {
   if (!accountId) return;
@@ -308,10 +494,15 @@ function escapeRegex(str: string) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Multer configured with diskStorage in os.tmpdir() with 2 GB limit
+// Multer configured with diskStorage in dedicated TEMP_DIR with 2 GB limit
 const upload = multer({
   storage: multer.diskStorage({
-    destination: os.tmpdir(),
+    destination: (_req, _file, cb) => {
+      try {
+        if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+      } catch { /* ignore */ }
+      cb(null, TEMP_DIR);
+    },
     filename: (_req, file, cb) => {
       const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
       cb(null, `upload_${Date.now()}_${nanoid(6)}_${safeName}`);
@@ -320,16 +511,104 @@ const upload = multer({
   limits: { fileSize: MAX_UPLOAD_BYTES },
 });
 
-// ─── MongoDB ─────────────────────────────────────────────────────────────────
+// ─── MongoDB (with auto-reconnect, pool & socket timeouts, and per-query maxTimeMS) ───
 const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
-const client   = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+const MONGODB_QUERY_TIMEOUT_MS = Math.max(1000, Number(process.env.MONGODB_QUERY_TIMEOUT_MS || 15_000));
+const client   = new MongoClient(mongoUri, {
+  serverSelectionTimeoutMS: 5000,
+  connectTimeoutMS: 5000,
+  socketTimeoutMS: Number(process.env.MONGODB_SOCKET_TIMEOUT_MS || 45_000),
+  maxPoolSize: Number(process.env.MONGODB_MAX_POOL_SIZE || 20),
+  minPoolSize: 1,
+  retryWrites: true,
+  retryReads: true,
+});
 let db: any = null;
+let mongoConnectPromise: Promise<any> | null = null;
 
-async function connectToMongo() {
+/**
+ * Wraps a MongoDB Db instance so every cursor and query applies a default maxTimeMS
+ * without breaking in-memory test collections.
+ */
+function wrapDbWithQueryTimeout(rawDb: any, timeoutMs = MONGODB_QUERY_TIMEOUT_MS): any {
+  if (!rawDb || typeof rawDb.collection !== 'function' || rawDb.__queryTimeoutWrapped) return rawDb;
+  const colCache = new Map<string, any>();
+  return new Proxy(rawDb, {
+    get(target, prop, receiver) {
+      if (prop === '__queryTimeoutWrapped') return true;
+      if (prop === 'collection') {
+        return (name: string, options?: any) => {
+          if (!options && colCache.has(name)) return colCache.get(name);
+          const rawCol = target.collection(name, options);
+          if (!rawCol || typeof rawCol !== 'object') return rawCol;
+          const wrappedCol = new Proxy(rawCol, {
+            get(colTarget, colProp, colReceiver) {
+              const orig = Reflect.get(colTarget, colProp, colReceiver);
+              if (typeof orig !== 'function') return orig;
+              if (colProp === 'find' || colProp === 'aggregate') {
+                return (...args: any[]) => {
+                  const cursor = orig.apply(colTarget, args);
+                  if (cursor && typeof cursor.maxTimeMS === 'function') {
+                    try { cursor.maxTimeMS(timeoutMs); } catch { /* ignore */ }
+                  }
+                  return cursor;
+                };
+              }
+              if ((colProp === 'findOne' || colProp === 'countDocuments') && typeof colTarget.dbName === 'string') {
+                return (filter: any = {}, opts?: any) => {
+                  const nextOpts = opts && typeof opts === 'object'
+                    ? (opts.maxTimeMS !== undefined ? opts : { ...opts, maxTimeMS: timeoutMs })
+                    : { maxTimeMS: timeoutMs };
+                  return orig.call(colTarget, filter, nextOpts);
+                };
+              }
+              return orig.bind(colTarget);
+            },
+          });
+          if (!options) colCache.set(name, wrappedCol);
+          return wrappedCol;
+        };
+      }
+      const val = Reflect.get(target, prop, receiver);
+      return typeof val === 'function' ? val.bind(target) : val;
+    },
+  });
+}
+
+client.on('connectionPoolReady', () => {
+  systemMetrics.mongoConnected = true;
+});
+client.on('connectionPoolClosed', () => {
+  systemMetrics.mongoConnected = false;
+});
+client.on('serverHeartbeatSucceeded', () => {
+  systemMetrics.mongoConnected = true;
+});
+client.on('error', (err) => {
+  console.error('[Mongo] Client pool error:', err);
+});
+
+async function connectToMongo(maxRetries = 3) {
   if (db) return db;
-  try {
-    await client.connect();
-    db = client.db('cloudyte');
+  if (mongoConnectPromise) return mongoConnectPromise;
+  mongoConnectPromise = (async () => {
+    try {
+      let lastErr: any;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          await client.connect();
+          db = wrapDbWithQueryTimeout(client.db('cloudyte'));
+          systemMetrics.mongoConnected = true;
+          break;
+        } catch (err) {
+          lastErr = err;
+          systemMetrics.mongoReconnects++;
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 500 * (2 ** (attempt - 1))));
+          }
+        }
+      }
+      if (!db) throw lastErr;
 
     // Startup indexes (ignore if they already exist)
     try { await db.collection('sessions').createIndex({ token: 1 }, { unique: true }); } catch { /* ignore */ }
@@ -350,8 +629,8 @@ async function connectToMongo() {
     try { await db.collection('upload_sessions').createIndex({ userId: 1, accountId: 1, idempotencyKey: 1 }); } catch { /* ignore */ }
     try { await db.collection('account_encryption_backups').createIndex({ accountId: 1, userId: 1 }, { unique: true }); } catch { /* ignore */ }
 
-    // Additional collection indexes
-    try { await db.collection('sessions').createIndex({ createdAt: 1 }, { expireAfterSeconds: 2592000 }); } catch { /* ignore */ }
+    // Additional collection indexes (drop legacy fixed 30d createdAt TTL so sliding expiresAt governs session expiry)
+    try { await db.collection('sessions').dropIndex('createdAt_1'); } catch { /* ignore */ }
     try { await db.collection('sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
     try { await db.collection('sessions').createIndex({ userId: 1, lastActiveAt: -1 }); } catch { /* ignore */ }
     try { await db.collection('tg_files').createIndex({ accountId: 1, trashed: 1, trashedAt: -1 }); } catch { /* ignore */ }
@@ -368,9 +647,13 @@ async function connectToMongo() {
     try { await db.collection('tg_files').createIndex({ name: 'text' }); } catch { /* ignore */ }
     try { await db.collection('shares').createIndex({ shareId: 1 }, { unique: true }); } catch { /* ignore */ }
     try { await db.collection('tg_folders').createIndex({ userId: 1 }); } catch { /* ignore */ }
-    try { await db.collection('jobs').createIndex({ type: 1, status: 1, nextRunAt: 1, createdAt: 1 }); } catch { /* ignore */ }
+    try { await db.collection('jobs').createIndex({ type: 1, status: 1, priority: -1, nextRunAt: 1, createdAt: 1 }); } catch { /* ignore */ }
+    try { await db.collection('jobs').createIndex({ status: 1, leaseUntil: 1 }); } catch { /* ignore */ }
     try { await db.collection('jobs').createIndex({ userId: 1, createdAt: -1 }); } catch { /* ignore */ }
     try { await db.collection('jobs').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); } catch { /* ignore */ }
+    try { await db.collection('upload_sessions').createIndex({ userId: 1, status: 1, createdAt: -1 }); } catch { /* ignore */ }
+    try { await db.collection('transfer_manifests').createIndex({ jobId: 1 }, { unique: true }); } catch { /* ignore */ }
+    try { await db.collection('transfer_manifests').createIndex({ userId: 1, completedAt: -1 }); } catch { /* ignore */ }
 
     await runMigration(db);
     await runEncryptionMigration(db);
@@ -379,10 +662,14 @@ async function connectToMongo() {
     await runIndexDiagnostics(db);
 
     return db;
-  } catch (err) {
-    console.error('MongoDB error:', err);
-    throw err;
-  }
+    } catch (err) {
+      console.error('MongoDB initialization error:', err);
+      throw err;
+    } finally {
+      mongoConnectPromise = null;
+    }
+  })();
+  return mongoConnectPromise;
 }
 
 export async function runEncryptionMigration(database: any) {
@@ -588,12 +875,25 @@ const requireAuth = async (req: any, res: any, next: any) => {
   if (token && token.length <= 256) {
     const cachedAuth = authCache.get(token) as any;
     if (cachedAuth) {
-      if (cachedAuth.expiresAt && cachedAuth.expiresAt < Date.now()) {
+      const nowMs = Date.now();
+      if (cachedAuth.expiresAt && cachedAuth.expiresAt < nowMs) {
         authCache.del(token);
         if (req.db) {
           try { await req.db.collection('sessions').deleteOne({ token }); } catch { /* ignore */ }
         }
         return res.status(401).json({ error: 'Session expired' });
+      }
+      if (!cachedAuth.lastTouchedAt || nowMs - cachedAuth.lastTouchedAt >= SESSION_TOUCH_INTERVAL_MS) {
+        const newNow = new Date(nowMs);
+        const newExp = new Date(nowMs + SESSION_TTL_MS);
+        const updatedAuth = { ...cachedAuth, lastTouchedAt: nowMs, expiresAt: newExp.getTime() };
+        authCache.set(token, updatedAuth);
+        if (req.db) {
+          req.db.collection('sessions').updateOne(
+            { token },
+            { $set: { lastActiveAt: newNow, expiresAt: newExp } }
+          ).catch(() => {});
+        }
       }
       req.userId    = cachedAuth.userId;
       req.isAdmin   = cachedAuth.isAdmin;
@@ -619,16 +919,18 @@ const requireAuth = async (req: any, res: any, next: any) => {
           const nowMs = Date.now();
           const lastActiveMs = session.lastActiveAt ? new Date(session.lastActiveAt).getTime() : 0;
           let nextExpMs = expMs ?? (nowMs + SESSION_TTL_MS);
+          let lastTouchedAt = lastActiveMs || nowMs;
           if (!lastActiveMs || nowMs - lastActiveMs >= SESSION_TOUCH_INTERVAL_MS) {
             const newNow = new Date(nowMs);
             const newExp = new Date(nowMs + SESSION_TTL_MS);
             nextExpMs = newExp.getTime();
+            lastTouchedAt = nowMs;
             req.db.collection('sessions').updateOne(
               { _id: session._id },
               { $set: { sessionId, lastActiveAt: newNow, expiresAt: newExp } }
             ).catch(() => {});
           }
-          const authData = { userId: user._id, isAdmin: !!user.isAdmin, user, sessionId, expiresAt: nextExpMs };
+          const authData = { userId: user._id, isAdmin: !!user.isAdmin, user, sessionId, expiresAt: nextExpMs, lastTouchedAt };
           authCache.set(token, authData);
           req.userId    = user._id;
           req.isAdmin   = !!user.isAdmin;
@@ -735,11 +1037,21 @@ export function setTestDependencies(deps: {
   driveCache.flushAll();
 }
 
-async function getDriveClient(tokens: any) {
+async function getDriveClient(tokens: any, accountId?: string) {
   if (testDriveClientFactory) return testDriveClientFactory(tokens);
   const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
   auth.setCredentials(tokens);
-  return google.drive({ version: 'v3', auth });
+  if (accountId && ObjectId.isValid(accountId)) {
+    auth.on('tokens', (newTokens) => {
+      const merged = { ...tokens, ...newTokens };
+      tokens = merged;
+      const d = db;
+      if (d) {
+        d.collection('accounts').updateOne({ _id: new ObjectId(accountId) }, { $set: { tokens: merged } }).catch(() => {});
+      }
+    });
+  }
+  return google.drive({ version: 'v3', auth, timeout: PROVIDER_API_TIMEOUT_MS });
 }
 
 async function getOneDriveClient(tokens: any, accountId?: string) {
@@ -752,17 +1064,23 @@ async function getOneDriveClient(tokens: any, accountId?: string) {
       try {
         const isExpired = !tokens.expiry_date || Date.now() > tokens.expiry_date - 300000;
         if (isExpired && tokens.refresh_token) {
-          const r = await axios.post('https://login.microsoftonline.com/common/oauth2/v2.0/token',
-            new URLSearchParams({
-              client_id: MICROSOFT_CLIENT_ID!, client_secret: MICROSOFT_CLIENT_SECRET!,
-              grant_type: 'refresh_token', refresh_token: tokens.refresh_token,
-            }));
-          tokens = { ...tokens, access_token: r.data.access_token, refresh_token: r.data.refresh_token || tokens.refresh_token,
-            expires_in: r.data.expires_in, expiry_date: Date.now() + Number(r.data.expires_in) * 1000 };
-          if (accountId) {
-            const d = db || await connectToMongo();
-            await d.collection('accounts').updateOne({ _id: new ObjectId(accountId) }, { $set: { tokens } });
-          }
+          await withSessionLock(`onedrive_token:${accountId || 'anon'}`, async () => {
+            const stillExpired = !tokens.expiry_date || Date.now() > tokens.expiry_date - 300000;
+            if (!stillExpired) return;
+            const r = await axios.post('https://login.microsoftonline.com/common/oauth2/v2.0/token',
+              new URLSearchParams({
+                client_id: MICROSOFT_CLIENT_ID!, client_secret: MICROSOFT_CLIENT_SECRET!,
+                grant_type: 'refresh_token', refresh_token: tokens.refresh_token,
+              }),
+              { timeout: 15_000 }
+            );
+            tokens = { ...tokens, access_token: r.data.access_token, refresh_token: r.data.refresh_token || tokens.refresh_token,
+              expires_in: r.data.expires_in, expiry_date: Date.now() + Number(r.data.expires_in) * 1000 };
+            if (accountId && ObjectId.isValid(accountId)) {
+              const d = db || await connectToMongo();
+              await d.collection('accounts').updateOne({ _id: new ObjectId(accountId) }, { $set: { tokens } });
+            }
+          });
           done(null, tokens.access_token);
         } else { done(null, tokens.access_token); }
       } catch (err: any) { done(err, null); }
@@ -833,6 +1151,7 @@ async function tgUploadFile(
   encryptionSpec?: ValidatedUploadSpec, userId?: string
 ) {
   return providerLimit(`telegram:upload:${accountId}`, 2)(async () => {
+    const startedAt = Date.now();
     const database = db || await connectToMongo();
     if (idempotencyKey) {
       const existing = await database.collection('tg_files').findOne({ accountId: new ObjectId(accountId), idempotencyKey });
@@ -855,14 +1174,21 @@ async function tgUploadFile(
       }
     }
     const effectiveCaption = isEncrypted ? TELEGRAM_ENCRYPTED_CAPTION_MARKER : caption;
-    const telegram   = await getTgClient();
-    const peerEntity = await resolvePeer(telegram, channelId);
-    const result     = await telegram.sendFile(peerEntity, {
-      file: filePath,
-      caption: effectiveCaption,
-      forceDocument: true,
-      attributes: [new Api.DocumentAttributeFilename({ fileName: effectiveName })],
-    }) as any;
+    let result: any;
+    try {
+      const telegram   = await getTgClient();
+      const peerEntity = await resolvePeer(telegram, channelId);
+      result           = await telegram.sendFile(peerEntity, {
+        file: filePath,
+        caption: effectiveCaption,
+        forceDocument: true,
+        attributes: [new Api.DocumentAttributeFilename({ fileName: effectiveName })],
+      }) as any;
+      recordProviderCall('telegram', 'sendFile', Date.now() - startedAt, true, 0);
+    } catch (tgErr: any) {
+      recordProviderCall('telegram', 'sendFile', Date.now() - startedAt, false, 0, tgErr?.code || 'ERROR');
+      throw tgErr;
+    }
     const messageId = result.id as number;
     const nowSec    = Math.floor(Date.now() / 1000);
     const nowMs     = Date.now();
@@ -935,13 +1261,43 @@ function waitForDrainOrClose(res: any): Promise<void> {
   });
 }
 
-function pipeUpstreamWithAbort(upstreamStream: NodeJS.ReadableStream & { destroy?: () => void }, req: any, res: any) {
+function pipeUpstreamWithAbort(
+  upstreamStream: NodeJS.ReadableStream & { destroy?: (err?: Error) => void },
+  req: any,
+  res: any,
+  idleTimeoutMs = DOWNLOAD_IDLE_TIMEOUT_MS
+) {
   let cleaned = false;
+  let idleTimer: NodeJS.Timeout | null = null;
+
+  const clearIdle = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
+  const resetIdle = () => {
+    clearIdle();
+    if (idleTimeoutMs > 0 && !cleaned) {
+      idleTimer = setTimeout(() => {
+        const timeoutErr = new Error('Upstream stream idle timeout');
+        onUpstreamError(timeoutErr);
+        try { upstreamStream.destroy?.(timeoutErr); } catch { /* ignore */ }
+      }, idleTimeoutMs);
+      idleTimer.unref?.();
+    }
+  };
+
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
+    clearIdle();
     res.off('close', onClientClose);
+    req?.off?.('aborted', onClientClose);
+    upstreamStream.off?.('data', resetIdle);
     upstreamStream.off?.('error', onUpstreamError);
+    upstreamStream.off?.('end', cleanup);
   };
   const onClientClose = () => {
     cleanup();
@@ -958,7 +1314,10 @@ function pipeUpstreamWithAbort(upstreamStream: NodeJS.ReadableStream & { destroy
       res.destroy(err);
     }
   };
+  resetIdle();
   res.on('close', onClientClose);
+  req?.on?.('aborted', onClientClose);
+  upstreamStream.on('data', resetIdle);
   upstreamStream.on('error', onUpstreamError);
   upstreamStream.on('end', cleanup);
   upstreamStream.pipe(res);
@@ -967,10 +1326,33 @@ function pipeUpstreamWithAbort(upstreamStream: NodeJS.ReadableStream & { destroy
 // Stream a TG file to an HTTP response (supports Range headers for video/audio and encrypted files).
 async function tgStreamFile(messageId: number, channelId: string, req: any, res: any, meta: any) {
   let clientAborted = false;
-  const onClose = () => { clientAborted = true; };
+  let idleTimer: NodeJS.Timeout | null = null;
+  const startedAt = Date.now();
+  const clearIdle = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+  const resetIdle = () => {
+    clearIdle();
+    if (DOWNLOAD_IDLE_TIMEOUT_MS > 0 && !clientAborted) {
+      idleTimer = setTimeout(() => {
+        clientAborted = true;
+        if (!res.writableEnded) res.destroy(new Error('Telegram stream idle timeout'));
+      }, DOWNLOAD_IDLE_TIMEOUT_MS);
+      idleTimer.unref?.();
+    }
+  };
+  const onClose = () => {
+    clientAborted = true;
+    clearIdle();
+  };
   res.on('close', onClose);
+  req?.on?.('aborted', onClose);
 
   try {
+    resetIdle();
     const telegram = await getTgClient();
     const peer     = await resolvePeer(telegram, channelId);
     const messages = await telegram.getMessages(peer, { ids: [messageId] });
@@ -1002,6 +1384,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
       const alignedStart = start - skipBytes;
       let downloaded = 0;
       for await (const rawChunk of telegram.iterDownload({ file: media, requestSize: stepSize, offset: tgHelpers.returnBigInt(alignedStart) })) {
+        resetIdle();
         if (clientAborted || res.destroyed) break;
         let usableChunk = rawChunk;
         if (skipBytes > 0) {
@@ -1029,6 +1412,7 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
       res.setHeader('Accept-Ranges', 'bytes');
       if (totalSize) res.setHeader('Content-Length', totalSize);
       for await (const chunk of telegram.iterDownload({ file: media, requestSize: 512 * 1024 })) {
+        resetIdle();
         if (clientAborted || res.destroyed) break;
         const canContinue = res.write(chunk);
         if (!canContinue) {
@@ -1038,14 +1422,18 @@ async function tgStreamFile(messageId: number, channelId: string, req: any, res:
       }
       if (!clientAborted && !res.writableEnded) res.end();
     }
+    recordProviderCall('telegram', 'streamFile', Date.now() - startedAt, true, 0);
   } catch (err: any) {
+    recordProviderCall('telegram', 'streamFile', Date.now() - startedAt, false, 0, err?.code || 'ERROR');
     if (!clientAborted) {
       console.error('tgStreamFile error:', err);
       if (!res.headersSent) res.status(500).send('Streaming error');
       else if (!res.writableEnded) res.destroy(err);
     }
   } finally {
+    clearIdle();
     res.off('close', onClose);
+    req?.off?.('aborted', onClose);
   }
 }
 
@@ -1209,7 +1597,7 @@ async function generateThumbnail(account: any, fileId: string, s: number, thumbP
 
     return thumbPath;
   } else if (account.accountType === 'google') {
-    const drive = await getDriveClient(account.tokens || account.credentials);
+    const drive = await getDriveClient(account.tokens || account.credentials, String(account._id));
     const fileRes = await drive.files.get({ fileId, fields: 'thumbnailLink' });
     let link = fileRes.data.thumbnailLink;
     if (!link) return null;
@@ -1255,8 +1643,8 @@ app.use((req, res, next) => {
   if (origin && allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Request-ID');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Request-ID, Idempotency-Key, X-File-Checksum, X-Chunk-Offset');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS');
   }
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -1273,24 +1661,78 @@ app.use((req: any, res, next) => {
   req.requestId = requestId;
   res.setHeader('X-Request-ID', requestId);
   res.setHeader('X-Correlation-Id', requestId);
+
+  if (isShuttingDown && req.path !== '/healthz') {
+    return apiError(res, 503, STANDARD_ERROR_CODES.INTERNAL_ERROR, 'Server is shutting down; please retry shortly', requestId, true);
+  }
+
+  systemMetrics.requestsTotal++;
+  activeHttpConnections++;
+  let connDecremented = false;
+  const decConn = () => {
+    if (!connDecremented) {
+      connDecremented = true;
+      activeHttpConnections = Math.max(0, activeHttpConnections - 1);
+    }
+  };
+  const origJson = res.json.bind(res);
+  res.json = (body: any) => {
+    if (body && typeof body === 'object' && !Array.isArray(body) && (res.statusCode >= 400 || typeof body.error === 'string')) {
+      const resolvedCode = typeof body.code === 'string' && body.code
+        ? body.code
+        : errorCode(res.statusCode >= 400 ? res.statusCode : 500);
+      const resolvedRetryable = typeof body.retryable === 'boolean'
+        ? body.retryable
+        : (res.statusCode >= 500 || res.statusCode === 429);
+      if (res.locals) res.locals.errorCode = resolvedCode;
+      return origJson({
+        ...body,
+        code: resolvedCode,
+        requestId: body.requestId ?? requestId,
+        retryable: resolvedRetryable,
+      });
+    }
+    return origJson(body);
+  };
+
+  res.once('close', decConn);
+
   res.once('finish', () => {
+    decConn();
+    const durationMs = Date.now() - startedAt;
+    const isSlow = durationMs >= SLOW_REQUEST_MS;
+    if (isSlow) systemMetrics.slowRequestsTotal++;
     console.log(JSON.stringify({
-      event: 'http_request',
+      event: isSlow ? 'http_slow_request' : 'http_request',
       requestId,
       method: req.method,
       path: req.path,
       status: res.statusCode,
-      durationMs: Date.now() - startedAt,
+      durationMs,
+      slow: isSlow || undefined,
       userId: req.userId ? String(req.userId) : undefined,
+      errorCode: res.locals?.errorCode || (res.statusCode >= 400 ? errorCode(res.statusCode) : undefined),
     }));
   });
   next();
 });
-// Liveness only checks that the process is running; readiness also requires MongoDB.
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-app.get('/readyz', (_req, res) => {
-  if (!db) return res.status(503).json({ ok: false, error: 'Database not ready' });
-  res.json({ ok: true });
+// Liveness only checks that the process is running; readiness also requires MongoDB & not shutting down.
+app.get('/healthz', (_req, res) => res.json({
+  ok: true,
+  uptimeSec: Math.floor(process.uptime()),
+}));
+app.get('/readyz', async (req: any, res) => {
+  if (isShuttingDown) {
+    return apiError(res, 503, STANDARD_ERROR_CODES.INTERNAL_ERROR, 'Server is shutting down', req.requestId, true);
+  }
+  if (!db) {
+    return res.status(503).json({ ok: false, status: 'not_ready', mongo: false, error: 'Database not ready', code: STANDARD_ERROR_CODES.INTERNAL_ERROR, requestId: req.requestId, retryable: true });
+  }
+  const hasDisk = hasTempDiskHeadroom(0);
+  if (!hasDisk) {
+    return res.status(503).json({ ok: false, status: 'not_ready', mongo: true, diskHeadroom: false, error: 'Temporary disk space critically low', code: STANDARD_ERROR_CODES.INSUFFICIENT_STORAGE, requestId: req.requestId, retryable: true });
+  }
+  res.json({ ok: true, status: 'ready', mongo: true, diskHeadroom: true });
 });
 
 // 7. ROBUSTNESS: Rate limiter for login & register (10 requests/min per IP)
@@ -1300,7 +1742,7 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: () => process.env.CLOUDYTE_TEST_MODE === '1',
-  message: { error: 'Too many requests, please try again later.' }
+  message: { error: 'Too many requests, please try again later.', code: STANDARD_ERROR_CODES.RATE_LIMITED, retryable: true }
 });
 
 const uploadLimiter = rateLimit({
@@ -1309,13 +1751,24 @@ const uploadLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: () => process.env.CLOUDYTE_TEST_MODE === '1',
-  message: { error: 'Upload rate limit exceeded.', code: 'RATE_LIMITED' },
+  message: { error: 'Upload rate limit exceeded.', code: STANDARD_ERROR_CODES.RATE_LIMITED, retryable: true },
+});
+
+const downloadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => process.env.CLOUDYTE_TEST_MODE === '1',
+  message: { error: 'Download rate limit exceeded.', code: STANDARD_ERROR_CODES.RATE_LIMITED, retryable: true },
 });
 
 app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
 app.use('/api/upload', uploadLimiter);
 app.use('/api/upload-sessions', uploadLimiter);
+app.use('/api/download', downloadLimiter);
+app.use('/api/public/download', downloadLimiter);
 
 // ─── Auth routes ─────────────────────────────────────────────────────────────
 app.post('/api/register', async (req, res) => {
@@ -1360,15 +1813,22 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.get('/api/public/settings', async (_req, res) => {
-  const database = db || await connectToMongo();
-  const settings = await database.collection('settings').find({}).toArray();
-  const publicSettings: any = {};
-  settings.forEach((s: any) => {
-    if (s.key === 'registrationEnabled' || s.key === 'webRegistrationEnabled' || s.key === 'botRegistrationEnabled') {
-      publicSettings[s.key] = s.value;
-    }
-  });
-  res.json(publicSettings);
+  try {
+    const database = db || await Promise.race([
+      connectToMongo(1),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000)),
+    ]);
+    const settings = await database.collection('settings').find({}).toArray();
+    const publicSettings: any = {};
+    settings.forEach((s: any) => {
+      if (s.key === 'registrationEnabled' || s.key === 'webRegistrationEnabled' || s.key === 'botRegistrationEnabled') {
+        publicSettings[s.key] = s.value;
+      }
+    });
+    res.json(publicSettings);
+  } catch {
+    res.json({ registrationEnabled: true, webRegistrationEnabled: true, botRegistrationEnabled: true });
+  }
 });
 
 app.post('/api/login', async (req, res) => {
@@ -1430,6 +1890,89 @@ app.get('/api/admin/stats', requireAuth, async (req: any, res: any) => {
     totalFiles: await database.collection('tg_files').countDocuments(),
   };
   res.json(stats);
+});
+
+app.get('/api/admin/metrics', requireAuth, async (req: any, res: any) => {
+  if (!req.isAdmin) return apiError(res, 403, STANDARD_ERROR_CODES.FORBIDDEN, 'Forbidden', req.requestId);
+  const database = req.db || db || await connectToMongo();
+  const mem = process.memoryUsage();
+  const cpu = process.cpuUsage();
+  const tempFreeBytes = getFreeBytes(TEMP_DIR);
+  const hasDiskHeadroom = hasTempDiskHeadroom();
+  const tempStats = getTempDirStats(TEMP_DIR);
+  const thumbStats = getTempDirStats(THUMB_DIR);
+
+  const [queuedJobs, runningJobs, failedJobs, deadLetterJobs, activeUploadSessions] = await Promise.all([
+    database.collection('jobs').countDocuments({ status: 'queued' }),
+    database.collection('jobs').countDocuments({ status: 'running' }),
+    database.collection('jobs').countDocuments({ status: 'failed' }),
+    database.collection('jobs').countDocuments({ status: 'failed', deadLettered: true }),
+    database.collection('upload_sessions').countDocuments({ status: { $in: ['active', 'paused', 'completing'] } }),
+  ]);
+
+  const alerts: { code: string; severity: 'warning' | 'critical'; message: string }[] = [];
+  if (!hasDiskHeadroom) {
+    alerts.push({ code: 'LOW_TEMP_DISK_SPACE', severity: 'critical', message: 'Temporary disk headroom is below MIN_TEMP_FREE_BYTES threshold' });
+  }
+  if (queuedJobs >= Math.floor(MAX_JOB_QUEUE_DEPTH * 0.8)) {
+    alerts.push({ code: 'JOB_QUEUE_BACKLOG', severity: 'warning', message: `Background job queue depth (${queuedJobs}) is approaching limit (${MAX_JOB_QUEUE_DEPTH})` });
+  }
+  if (deadLetterJobs > 0) {
+    alerts.push({ code: 'DEAD_LETTER_JOBS_PRESENT', severity: 'warning', message: `${deadLetterJobs} background job(s) have exhausted retries` });
+  }
+  for (const [provider, bucket] of Object.entries(systemMetrics.providerCalls)) {
+    if (bucket.consecutiveFailures >= 3) {
+      alerts.push({ code: `PROVIDER_DEGRADED_${provider.toUpperCase()}`, severity: 'warning', message: `Provider ${provider} has ${bucket.consecutiveFailures} consecutive failures` });
+    }
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    uptimeSeconds: Math.floor((Date.now() - systemMetrics.startedAt) / 1000),
+    workerId: WORKER_ID,
+    shuttingDown: isShuttingDown,
+    memoryUsage: {
+      rssBytes: mem.rss,
+      heapUsedBytes: mem.heapUsed,
+      heapTotalBytes: mem.heapTotal,
+      externalBytes: mem.external,
+    },
+    cpuUsage: cpu,
+    eventLoopLagMs: systemMetrics.eventLoopLagMs,
+    openFileDescriptors: getOpenFileDescriptorCount(),
+    connections: {
+      activeHttpConnections,
+      activeGlobalUploads,
+      activeUploadUsers: activeUploadsByUser.size,
+      activeDownloadUsers: activeDownloadsByUser.size,
+    },
+    disk: {
+      tempDir: TEMP_DIR,
+      tempFreeBytes,
+      minTempFreeBytes: MIN_TEMP_FREE_BYTES,
+      hasDiskHeadroom,
+      tempFiles: tempStats,
+      thumbFiles: thumbStats,
+    },
+    jobs: {
+      queued: queuedJobs,
+      running: runningJobs,
+      failed: failedJobs,
+      deadLettered: deadLetterJobs,
+      maxQueueDepth: MAX_JOB_QUEUE_DEPTH,
+    },
+    uploads: {
+      activeSessions: activeUploadSessions,
+      completedTotal: systemMetrics.uploadsCompleted,
+      failedTotal: systemMetrics.uploadsFailed,
+    },
+    cache: {
+      driveCacheKeys: driveCache.keys().length,
+      authCacheKeys: authCache.keys().length,
+    },
+    metrics: systemMetrics,
+    alerts,
+  });
 });
 
 app.get('/api/admin/users', requireAuth, async (req: any, res: any) => {
@@ -1820,6 +2363,10 @@ async function computeSingleAccountStorageSummary(account: any, database: any) {
   const cached = driveCache.get(cacheKey) as any;
   if (cached) return cached;
 
+  return withCacheStampedeProtection(cacheKey, async () => {
+    const secondCheck = driveCache.get(cacheKey) as any;
+    if (secondCheck) return secondCheck;
+
   if (account.accountType === 'tgdrive') {
     const docs = await database.collection('tg_files')
       .find({ accountId: account._id, trashed: { $ne: true } })
@@ -1921,6 +2468,7 @@ async function computeSingleAccountStorageSummary(account: any, database: any) {
   };
   driveCache.set(cacheKey, summary, 60);
   return summary;
+  });
 }
 
 // ─── /api/accounts ────────────────────────────────────────────────────────────
@@ -2401,6 +2949,15 @@ app.get('/api/files', requireAuth, async (req: any, res: any) => {
         }
         rawFiles = (r.value || []).map((f: any) => ({ id: f.id, name: f.name, mimeType: f.folder ? 'folder' : (f.file?.mimeType || ''), size: f.size, modifiedTime: f.lastModifiedDateTime, createdTime: f.createdDateTime, webViewLink: f.webUrl }));
       }
+      if (rawFiles.length > 0) {
+        const trashedDocs = await database.collection('tg_files')
+          .find({ accountId: account._id, trashed: true })
+          .toArray();
+        const trashedIds = new Set(trashedDocs.map((d: any) => String(d.providerFileId)).filter(Boolean));
+        if (trashedIds.size > 0) {
+          rawFiles = rawFiles.filter((f: any) => !trashedIds.has(String(f.id)));
+        }
+      }
     } else {
       // ── Google Drive ────────────────────────────────────────────────────────
       const drive = await getDriveClient(account.tokens || account.credentials);
@@ -2603,14 +3160,14 @@ app.delete('/api/files/:fileId', requireAuth, async (req: any, res: any) => {
           { _id: existingSidecar._id },
           { $set: { trashed: true, trashedAt: now, updatedAt: Date.now() } }
         );
-      } else if (itemMeta) {
+      } else {
         await database.collection('tg_files').insertOne({
           accountId: account._id,
           ...(userId ? { userId: String(userId) } : {}),
           providerFileId: String(fileId),
-          name: itemMeta.name || String(fileId),
-          mimeType: itemMeta.file?.mimeType || 'application/octet-stream',
-          size: Number(itemMeta.size) || 0,
+          name: itemMeta?.name || String(fileId),
+          mimeType: itemMeta?.file?.mimeType || (itemMeta?.folder ? 'folder' : 'application/octet-stream'),
+          size: Number(itemMeta?.size) || 0,
           isEncrypted: false,
           trashed: true,
           trashedAt: now,
@@ -2714,12 +3271,12 @@ async function listTrashForAccount(database: any, account: any): Promise<any[]> 
     });
   }
 
-  // OneDrive: return tracked trashed items in tg_files
+  // OneDrive: return tracked trashed items in tg_files merged with Graph recyclebin items if available
   const odTrashed = await database.collection('tg_files')
     .find({ accountId: account._id, trashed: true })
     .sort({ trashedAt: -1 })
     .toArray();
-  return odTrashed.map((f: any) => ({
+  const trackedItems = odTrashed.map((f: any) => ({
     ...normaliseTgFile(f, accIdStr),
     id: String(f.providerFileId || f._id),
     accountId: accIdStr,
@@ -2727,6 +3284,38 @@ async function listTrashForAccount(database: any, account: any): Promise<any[]> 
     trashed: true,
     trashedAt: f.trashedAt ? new Date(f.trashedAt).getTime() : Date.now(),
   }));
+  const seenIds = new Set(trackedItems.map((it: any) => String(it.id)));
+  try {
+    const c = await getOneDriveClient(account.tokens || account.credentials, accIdStr);
+    const rbReq = c.api('/me/drive/special/recyclebin/children');
+    const rbRes = typeof rbReq?.get === 'function' ? await rbReq.get() : null;
+    const rbList = Array.isArray(rbRes?.value) ? rbRes.value : [];
+    for (const f of rbList) {
+      const fid = String(f?.id || '');
+      if (!fid || seenIds.has(fid)) continue;
+      seenIds.add(fid);
+      const sz = Number(f.size) || 0;
+      const updatedAt = f.lastModifiedDateTime ? new Date(f.lastModifiedDateTime).getTime() : Date.now();
+      trackedItems.push({
+        id: fid,
+        accountId: accIdStr,
+        name: f.name || fid,
+        type: f.folder ? 'folder' : 'other',
+        mimeType: f.folder ? 'folder' : (f.file?.mimeType || 'application/octet-stream'),
+        size: sz ? (sz / (1024 ** 2)).toFixed(1) + ' MB' : '-',
+        sizeBytes: sz,
+        modified: f.lastModifiedDateTime ? new Date(f.lastModifiedDateTime).toLocaleDateString() : '-',
+        createdAt: f.createdDateTime ? new Date(f.createdDateTime).toLocaleDateString() : '-',
+        updatedAt,
+        thumbUrl: null,
+        isEncrypted: false,
+        isTgDrive: false,
+        trashed: true,
+        trashedAt: updatedAt,
+      });
+    }
+  } catch { /* ignore if Graph recyclebin endpoint is unavailable */ }
+  return trackedItems;
 }
 
 app.get('/api/trash', requireAuth, async (req: any, res: any) => {
@@ -2999,32 +3588,78 @@ type ProviderUploadFile = {
   mimetype: string;
 };
 
+function isRetryableProviderError(err: any, status?: number | null): boolean {
+  const code = String(err?.code || '');
+  const httpStatus = status ?? Number(err?.response?.status || err?.status || 0);
+  if (
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNABORTED' ||
+    code === 'EAI_AGAIN' ||
+    code === 'ENOTFOUND' ||
+    code === 'EPIPE' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'UND_ERR_SOCKET'
+  ) {
+    return true;
+  }
+  if (httpStatus === 429 || (httpStatus >= 500 && httpStatus < 600)) {
+    return true;
+  }
+  if (httpStatus === 403) {
+    const bodyStr = JSON.stringify(err?.response?.data || err?.errors || err?.message || '').toLowerCase();
+    if (
+      bodyStr.includes('ratelimitexceeded') ||
+      bodyStr.includes('userratelimitexceeded') ||
+      bodyStr.includes('quotaexceeded') ||
+      bodyStr.includes('throttled') ||
+      bodyStr.includes('too many requests')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function withTransientRetry<T>(
   operation: () => Promise<T>,
   shouldRetryStatus?: (res: T) => number | null,
-  maxAttempts = 3
+  maxAttempts = 3,
+  context?: { provider?: string; operation?: string }
 ): Promise<T> {
   let attempt = 0;
   let lastError: any;
+  const startedAt = Date.now();
   while (attempt < maxAttempts) {
     attempt++;
     try {
       const result = await operation();
       const status = shouldRetryStatus ? shouldRetryStatus(result) : null;
-      if (status !== null && (status === 429 || status >= 500) && attempt < maxAttempts) {
+      const isQuota403 = status === 403 && isRetryableProviderError({ response: result }, 403);
+      if (status !== null && (status === 429 || status >= 500 || isQuota403) && attempt < maxAttempts) {
         const retryAfterHeader = (result as any)?.headers?.['retry-after'];
-        const retryMs = retryAfterHeader ? Math.min(10_000, Math.max(500, Number(retryAfterHeader) * 1000)) : 500 * (2 ** (attempt - 1));
+        const jitter = Math.floor(Math.random() * 150);
+        const retryMs = retryAfterHeader
+          ? Math.min(10_000, Math.max(500, Number(retryAfterHeader) * 1000))
+          : Math.min(10_000, 500 * (2 ** (attempt - 1)) + jitter);
         await new Promise(r => setTimeout(r, retryMs));
         continue;
+      }
+      if (context?.provider) {
+        recordProviderCall(context.provider, context.operation || 'api_call', Date.now() - startedAt, status === null || status < 400, attempt - 1, status ?? 200);
       }
       return result;
     } catch (err: any) {
       lastError = err;
-      const code = err?.code;
-      const status = err?.response?.status;
-      const transient = code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ECONNABORTED' || status === 429 || (status >= 500 && status < 600);
-      if (!transient || attempt >= maxAttempts) throw err;
-      await new Promise(r => setTimeout(r, 500 * (2 ** (attempt - 1))));
+      const transient = isRetryableProviderError(err);
+      if (!transient || attempt >= maxAttempts) {
+        if (context?.provider) {
+          recordProviderCall(context.provider, context.operation || 'api_call', Date.now() - startedAt, false, attempt - 1, err?.response?.status || err?.code || 'ERR');
+        }
+        throw err;
+      }
+      const jitter = Math.floor(Math.random() * 150);
+      await new Promise(r => setTimeout(r, Math.min(10_000, 500 * (2 ** (attempt - 1)) + jitter)));
     }
   }
   throw lastError;
@@ -3391,13 +4026,18 @@ async function sweepUploadSessions() {
   if (!db) return;
   const sessions = db.collection('upload_sessions');
   const now = new Date();
-  const stale = await sessions.find({ status: { $in: ['active', 'expired', 'cancelled'] }, expiresAt: { $lte: now } }).limit(500).toArray();
+  const stale = await sessions.find({ status: { $in: ['active', 'paused', 'expired', 'cancelled'] }, expiresAt: { $lte: now } }).limit(500).toArray();
   for (const session of stale) {
     await withSessionLock(session.sessionId, async () => {
       if (session.tempPath) { try { fs.unlinkSync(session.tempPath); } catch (error: any) { if (error?.code !== 'ENOENT') console.error('[UploadSessions] Cleanup failed:', error); } }
-      await sessions.updateOne({ sessionId: session.sessionId, status: 'active', expiresAt: { $lte: now } }, { $set: { status: 'expired', updatedAt: now } });
+      await sessions.updateOne({ sessionId: session.sessionId, status: { $in: ['active', 'paused'] }, expiresAt: { $lte: now } }, { $set: { status: 'expired', updatedAt: now } });
     });
   }
+  // Recover stuck 'completing' sessions whose completion lease has expired
+  await sessions.updateMany(
+    { status: 'completing', completionLeaseExpiresAt: { $lte: Date.now() } },
+    { $set: { status: 'active', updatedAt: now }, $unset: { completionLeaseExpiresAt: '' } }
+  );
   await sessions.deleteMany({ status: 'completed', completedAt: { $lte: new Date(Date.now() - COMPLETED_SESSION_TTL_MS) } });
 }
 
@@ -3434,8 +4074,8 @@ async function resolveUploadSessionForRequest(req: any, sessionId: string): Prom
 }
 async function expireUploadSessionIfNeeded(sessions: any, session: any) {
   if (session.status === 'completed' && session.completedAt && Date.now() - new Date(session.completedAt).getTime() > COMPLETED_SESSION_TTL_MS) { await sessions.deleteOne({ sessionId: session.sessionId, status: 'completed' }); session.status = 'retained-expired'; }
-  if (session.status === 'active' && new Date(session.expiresAt || (new Date(session.createdAt).getTime() + UPLOAD_SESSION_TTL_MS)).getTime() <= Date.now()) {
-    await sessions.updateOne({ sessionId: session.sessionId, status: 'active' }, { $set: { status: 'expired', updatedAt: new Date() } });
+  if ((session.status === 'active' || session.status === 'paused') && new Date(session.expiresAt || (new Date(session.createdAt).getTime() + UPLOAD_SESSION_TTL_MS)).getTime() <= Date.now()) {
+    await sessions.updateOne({ sessionId: session.sessionId, status: { $in: ['active', 'paused'] } }, { $set: { status: 'expired', updatedAt: new Date() } });
     session.status = 'expired';
     if (session.tempPath && fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
   }
@@ -3446,12 +4086,14 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
   const {
     fileName,
     mimeType = 'application/octet-stream',
-    size,
+    size: rawSize,
+    totalBytes,
     folderId = 'root',
     checksum,
-    idempotencyKey,
+    idempotencyKey: rawIdempotencyKey,
     providerType: requestedProviderType,
-    desiredChunkSize,
+    desiredChunkSize: rawDesiredChunkSize,
+    chunkSize: rawChunkSize,
     isEncrypted,
     encryptionFormatVersion,
     encryptionKeyId,
@@ -3459,6 +4101,9 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
     opaqueRemoteName,
     encryptedSizeBytes,
   } = req.body || {};
+  const size = rawSize ?? totalBytes;
+  const desiredChunkSize = rawDesiredChunkSize ?? rawChunkSize;
+  const idempotencyKey = rawIdempotencyKey || req.header('Idempotency-Key') || req.header('X-Idempotency-Key');
 
   if (!idempotencyKey || typeof idempotencyKey !== 'string' || !idempotencyKey.trim()) {
     return apiError(res, 400, 'INVALID_UPLOAD_SESSION', 'fileName, size, and idempotencyKey are required', req.requestId);
@@ -3492,8 +4137,12 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
   }
   const spec = validation.spec;
 
+  if (!hasTempDiskHeadroom(spec.size)) {
+    return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low for this upload', req.requestId);
+  }
+
   const sessions = req.db.collection('upload_sessions');
-  const existing = await sessions.findOne({ userId: String(req.userId || ''), accountId, idempotencyKey, status: { $in: ['active', 'completed', 'completing'] } });
+  const existing = await sessions.findOne({ userId: String(req.userId || ''), accountId, idempotencyKey, status: { $in: ['active', 'paused', 'completed', 'completing'] } });
   if (existing) {
     await expireUploadSessionIfNeeded(sessions, existing);
     if (existing.status !== 'expired' && existing.status !== 'retained-expired') {
@@ -3509,6 +4158,20 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
       return res.json(publicUploadSession(existing));
     }
   }
+
+  if (!req.isAdmin && req.userId && MAX_DAILY_UPLOAD_BYTES_PER_USER > 0) {
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const recentSessions = await sessions.find({
+      userId: String(req.userId),
+      createdAt: { $gt: dayAgo },
+      status: { $in: ['active', 'paused', 'completing', 'completed'] },
+    }).toArray();
+    const usedToday = recentSessions.reduce((sum: number, s: any) => sum + (Number(s.totalBytes) || 0), 0);
+    if (usedToday + spec.size > MAX_DAILY_UPLOAD_BYTES_PER_USER) {
+      return apiError(res, 429, STANDARD_ERROR_CODES.RATE_LIMITED, 'Daily upload byte quota exceeded for this user', req.requestId, true);
+    }
+  }
+
   const requestedChunk = Number(desiredChunkSize);
   const chunkSize = Number.isFinite(requestedChunk) && requestedChunk > 0 ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, requestedChunk)) : 8 * 1024 * 1024;
   const session = {
@@ -3536,7 +4199,7 @@ app.post('/api/upload-sessions/:accountId', requireAuth, async (req: any, res: a
     expiresAt: new Date(Date.now() + UPLOAD_SESSION_TTL_MS),
     providerResumable: resolvedProviderType !== 'telegram',
     providerCancellable: resolvedProviderType === 'onedrive',
-    tempPath: path.join(os.tmpdir(), `transfer_${nanoid(18)}.part`),
+    tempPath: path.join(TEMP_DIR, `transfer_${nanoid(18)}.part`),
     status: 'active',
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -3556,15 +4219,59 @@ app.get('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res: an
   await expireUploadSessionIfNeeded(sessions, session);
   return res.json(publicUploadSession(session));
 });
+app.post('/api/upload-sessions/:sessionId/pause', requireAuth, async (req: any, res: any) => withSessionLock(req.params.sessionId, async () => {
+  const sessions = req.db.collection('upload_sessions');
+  const { session, accessDenied } = await resolveUploadSessionForRequest(req, req.params.sessionId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this upload session', req.requestId);
+  if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  await expireUploadSessionIfNeeded(sessions, session);
+  if (session.status === 'paused') return res.json(publicUploadSession(session));
+  if (session.status !== 'active') {
+    return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', `Cannot pause upload session in '${session.status}' status`, req.requestId);
+  }
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + UPLOAD_SESSION_TTL_MS);
+  await sessions.updateOne(
+    { sessionId: session.sessionId, status: 'active' },
+    { $set: { status: 'paused', expiresAt, updatedAt: now }, $unset: { chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } }
+  );
+  session.status = 'paused';
+  session.expiresAt = expiresAt;
+  return res.json(publicUploadSession(session));
+}));
+app.post('/api/upload-sessions/:sessionId/resume', requireAuth, async (req: any, res: any) => withSessionLock(req.params.sessionId, async () => {
+  const sessions = req.db.collection('upload_sessions');
+  const { session, accessDenied } = await resolveUploadSessionForRequest(req, req.params.sessionId);
+  if (accessDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this upload session', req.requestId);
+  if (!session) return apiError(res, 404, 'UPLOAD_SESSION_NOT_FOUND', 'Upload session not found', req.requestId);
+  await expireUploadSessionIfNeeded(sessions, session);
+  if (session.status === 'active') return res.json(publicUploadSession(session));
+  if (session.status !== 'paused') {
+    return apiError(res, 409, 'UPLOAD_SESSION_NOT_PAUSED', `Cannot resume upload session in '${session.status}' status`, req.requestId);
+  }
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + UPLOAD_SESSION_TTL_MS);
+  await sessions.updateOne(
+    { sessionId: session.sessionId, status: 'paused' },
+    { $set: { status: 'active', expiresAt, updatedAt: now } }
+  );
+  session.status = 'active';
+  session.expiresAt = expiresAt;
+  return res.json(publicUploadSession(session));
+}));
 app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('chunk'), async (req: any, res: any) => withSessionLock(req.params.sessionId, async () => {
   const sessions = req.db.collection('upload_sessions');
   const { session, accessDenied } = await resolveUploadSessionForRequest(req, req.params.sessionId);
   const chunk = req.file;
+  const contentType = String(req.header('Content-Type') || '').toLowerCase();
+  const contentLengthHeader = Number(req.header('Content-Length') || 0);
+  const isRawStream = !chunk && !contentType.includes('multipart/form-data') && Number.isFinite(contentLengthHeader) && contentLengthHeader > 0;
   const cleanupChunk = async () => {
     if (chunk?.path) {
       try { await fs.promises.unlink(chunk.path); } catch { /* ignore */ }
     }
   };
+  req.on('aborted', () => { cleanupChunk().catch(() => {}); });
   if (accessDenied) {
     await cleanupChunk();
     return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this upload session', req.requestId);
@@ -3582,14 +4289,21 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
     await cleanupChunk();
     return apiError(res, 409, 'UPLOAD_SESSION_NOT_ACTIVE', `Upload session is ${session.status}`, req.requestId);
   }
-  if (!chunk) return apiError(res, 400, 'NO_CHUNK_UPLOADED', 'No chunk uploaded', req.requestId);
+  if (!chunk && !isRawStream) return apiError(res, 400, 'NO_CHUNK_UPLOADED', 'No chunk uploaded', req.requestId);
+  const slot = acquireUserUploadSlot(String(req.userId || session.userId || 'anonymous'));
+  if (!slot.ok) {
+    await cleanupChunk();
+    return apiError(res, 429, STANDARD_ERROR_CODES.RATE_LIMITED, slot.reason || 'Too many concurrent uploads', req.requestId, true);
+  }
   const range = String(req.header('Content-Range') || '').match(/^bytes (\d+)-(\d+)\/(\d+)$/);
-  const start = range ? Number(range[1]) : Number(req.header('X-Chunk-Offset'));
-  const end = range ? Number(range[2]) : start + chunk.size - 1;
+  const offsetHeaderOrBody = req.header('X-Chunk-Offset') ?? req.body?.offset;
+  const start = range ? Number(range[1]) : Number(offsetHeaderOrBody);
+  const incomingChunkSize = chunk ? chunk.size : (range ? (Number(range[2]) - Number(range[1]) + 1) : contentLengthHeader);
+  const end = range ? Number(range[2]) : start + incomingChunkSize - 1;
   const total = range ? Number(range[3]) : session.totalBytes;
   let chunkLockOwner: string | null = null;
   try {
-    if (!Number.isFinite(start) || end < start || total !== session.totalBytes || end - start + 1 !== chunk.size) {
+    if (!Number.isFinite(start) || !Number.isFinite(incomingChunkSize) || incomingChunkSize <= 0 || end < start || total !== session.totalBytes || end - start + 1 !== incomingChunkSize) {
       return apiError(res, 400, 'INVALID_CONTENT_RANGE', 'Content-Range does not match the uploaded chunk', req.requestId);
     }
     // Exact replay after a lost response is acknowledged only when streamed SHA-256 matches committed slice.
@@ -3599,10 +4313,21 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
       if (end >= session.receivedBytes || existingSize < end + 1) {
         return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
       }
-      const committed = (session.committedChunks || []).find((item: any) => item.offset === start && item.length === chunk.size);
+      const committed = (session.committedChunks || []).find((item: any) => item.offset === start && item.length === incomingChunkSize);
       if (!committed) return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', 'Repeated chunk does not match any committed range', req.requestId);
       const [incomingDigest, existingRangeDigest] = await Promise.all([
-        computeFileSha256(chunk.path),
+        chunk
+          ? computeFileSha256(chunk.path)
+          : (async () => {
+              const h = crypto.createHash('sha256');
+              let bytesRead = 0;
+              for await (const buf of req) {
+                bytesRead += buf.length;
+                if (bytesRead > incomingChunkSize) break;
+                h.update(buf);
+              }
+              return bytesRead === incomingChunkSize ? h.digest('hex') : '';
+            })(),
         (async () => {
           const h = crypto.createHash('sha256');
           for await (const buf of fs.createReadStream(session.tempPath, { start, end, highWaterMark: 256 * 1024 })) h.update(buf);
@@ -3615,7 +4340,7 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
       return res.json({ sessionId: session.sessionId, receivedBytes: session.receivedBytes, totalBytes: session.totalBytes, nextOffset: session.receivedBytes, complete: session.receivedBytes === session.totalBytes });
     }
     if (start !== session.receivedBytes) return apiError(res, 409, 'UPLOAD_SESSION_OFFSET_CONFLICT', `Expected offset ${session.receivedBytes}`, req.requestId);
-    if (!hasTempDiskHeadroom(chunk.size)) return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low', req.requestId);
+    if (!hasTempDiskHeadroom(incomingChunkSize)) return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low', req.requestId);
     chunkLockOwner = nanoid(16);
     const acquired = await sessions.updateOne({
       sessionId: session.sessionId, userId: String(session.userId || ''), status: 'active', receivedBytes: session.receivedBytes,
@@ -3629,14 +4354,37 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
     if (existingSize > session.receivedBytes) await fs.promises.truncate(session.tempPath, session.receivedBytes);
 
     const chunkHash = crypto.createHash('sha256');
-    const readChunk = fs.createReadStream(chunk.path, { highWaterMark: 256 * 1024 });
-    readChunk.on('data', (buf) => chunkHash.update(buf));
+    let streamedBytes = 0;
     const appendStream = fs.createWriteStream(session.tempPath, { flags: 'a', highWaterMark: 256 * 1024 });
-    await stream.promises.pipeline(readChunk, appendStream);
+    if (chunk) {
+      const readChunk = fs.createReadStream(chunk.path, { highWaterMark: 256 * 1024 });
+      readChunk.on('data', (buf: Buffer) => {
+        streamedBytes += buf.length;
+        chunkHash.update(buf);
+      });
+      await stream.promises.pipeline(readChunk, appendStream);
+    } else {
+      const countAndHashTransform = new stream.Transform({
+        transform(buf: Buffer, _enc, cb) {
+          streamedBytes += buf.length;
+          if (streamedBytes > incomingChunkSize) {
+            cb(new Error('Chunk stream exceeded declared length'));
+            return;
+          }
+          chunkHash.update(buf);
+          cb(null, buf);
+        },
+      });
+      await stream.promises.pipeline(req, countAndHashTransform, appendStream);
+    }
+    if (streamedBytes !== incomingChunkSize) {
+      await fs.promises.truncate(session.tempPath, session.receivedBytes);
+      return apiError(res, 400, 'INVALID_CONTENT_RANGE', 'Uploaded chunk size did not match declared range', req.requestId);
+    }
 
-    const receivedBytes = session.receivedBytes + chunk.size;
+    const receivedBytes = session.receivedBytes + incomingChunkSize;
     const chunkChecksum = chunkHash.digest('hex');
-    const committedChunks = [...(session.committedChunks || []), { offset: start, length: chunk.size, checksum: chunkChecksum }];
+    const committedChunks = [...(session.committedChunks || []), { offset: start, length: incomingChunkSize, checksum: chunkChecksum }];
     const now = new Date();
     const updated = await sessions.updateOne(
       { sessionId: session.sessionId, userId: String(session.userId || ''), status: 'active', receivedBytes: session.receivedBytes, chunkLeaseOwner: chunkLockOwner },
@@ -3663,6 +4411,7 @@ app.put('/api/upload-sessions/:sessionId/chunks', requireAuth, upload.single('ch
       await sessions.updateOne({ sessionId: session.sessionId, chunkLeaseOwner: chunkLockOwner }, { $unset: { chunkLeaseOwner: '', chunkLeaseExpiresAt: '' } });
     }
     await cleanupChunk();
+    slot.release();
   }
 }));
 app.post('/api/upload-sessions/:sessionId/complete', requireAuth, async (req: any, res: any) => withSessionLock(req.params.sessionId, async () => {
@@ -3744,10 +4493,12 @@ app.post('/api/upload-sessions/:sessionId/complete', requireAuth, async (req: an
       encryptedSizeBytes: session.isEncrypted ? session.totalBytes : null,
     };
     await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'completed', checksum, completedAt: new Date(), finalResult: finalPayload, updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
+    systemMetrics.uploadsCompleted++;
     invalidateDriveCache(session.accountId);
     if (fs.existsSync(session.tempPath)) { try { fs.unlinkSync(session.tempPath); } catch { /* janitor will retry */ } }
     return res.json(finalPayload);
   } catch (err: any) {
+    systemMetrics.uploadsFailed++;
     console.error('Resumable upload completion error:', err);
     await sessions.updateOne({ sessionId: session.sessionId, status: 'completing' }, { $set: { status: 'active', updatedAt: new Date() }, $unset: { completionLeaseExpiresAt: '' } });
     if (err?.code === 'UNSUPPORTED_PROVIDER_OPERATION') return apiError(res, 422, err.code, err.message, req.requestId);
@@ -3770,7 +4521,7 @@ app.delete('/api/upload-sessions/:sessionId', requireAuth, async (req: any, res:
   if (completing && !nativeOneDrive) {
     return apiError(res, 409, 'PROVIDER_CANCELLATION_UNSUPPORTED', 'The active provider upload cannot be safely cancelled; it may finish or expire upstream', req.requestId);
   }
-  const allowed = completing ? ['completing'] : ['active', 'expired', 'cancelled'];
+  const allowed = completing ? ['completing'] : ['active', 'paused', 'expired', 'cancelled'];
   const fenced = await sessions.updateOne({
     sessionId: session.sessionId, userId: String(session.userId || ''), status: { $in: allowed },
     $or: [{ chunkLeaseExpiresAt: { $exists: false } }, { chunkLeaseExpiresAt: { $lte: Date.now() } }]
@@ -3807,19 +4558,28 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
       try { fs.unlinkSync(file.path); } catch { /* ignore */ }
     }
   };
+  req.on('aborted', cleanupTemp);
 
   if (!hasTempDiskHeadroom(file.size)) {
     cleanupTemp();
     return apiError(res, 507, 'INSUFFICIENT_STORAGE', 'Server temporary storage is too low for this upload', req.requestId);
   }
 
+  const slot = acquireUserUploadSlot(String(userId || 'anonymous'));
+  if (!slot.ok) {
+    cleanupTemp();
+    return apiError(res, 429, STANDARD_ERROR_CODES.RATE_LIMITED, slot.reason || 'Too many concurrent uploads', req.requestId, true);
+  }
+
   const { account, accessDenied } = await resolveAuthorizedAccount(database, accountId, userId, req.isAdmin);
   if (accessDenied) {
     cleanupTemp();
+    slot.release();
     return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this account', req.requestId);
   }
   if (!account) {
     cleanupTemp();
+    slot.release();
     return apiError(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found', req.requestId);
   }
 
@@ -3849,6 +4609,7 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
   });
   if (!validation.ok) {
     cleanupTemp();
+    slot.release();
     return apiError(res, validation.error.status, validation.error.code, validation.error.message, req.requestId);
   }
   const spec = validation.spec;
@@ -3879,6 +4640,7 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
       spec,
       String(userId || account.userId || '')
     );
+    systemMetrics.uploadsCompleted++;
     invalidateDriveCache(accountId);
     res.json({
       success: true,
@@ -3890,10 +4652,12 @@ app.post('/api/upload/:accountId', requireAuth, upload.single('file'), async (re
       encryptedSizeBytes: spec.isEncrypted ? spec.size : null,
     });
   } catch (err: any) {
+    systemMetrics.uploadsFailed++;
     console.error('Upload error:', err);
     if (err?.code === 'UNSUPPORTED_PROVIDER_OPERATION') return apiError(res, 422, err.code, err.message, req.requestId);
     apiError(res, 502, 'PROVIDER_UPLOAD_FAILED', 'Provider upload failed', req.requestId);
   } finally {
+    slot.release();
     cleanupTemp();
   }
 });
@@ -3935,6 +4699,16 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
     return res.status(400).send('Invalid file identifier');
   }
 
+  let downloadSlot = { ok: true, release: () => {} };
+  if (!isHead) {
+    downloadSlot = acquireUserDownloadSlot(String(userId || req.ip || 'anonymous'));
+    if (!downloadSlot.ok) {
+      return apiError(res, 429, STANDARD_ERROR_CODES.RATE_LIMITED, 'Too many concurrent downloads for this user', req.requestId, true);
+    }
+    res.once('close', downloadSlot.release);
+    res.once('finish', downloadSlot.release);
+  }
+
   try {
     let account: any = null;
     const isSigned = Boolean(req.mediaSigned || req.isSignedMedia);
@@ -3952,6 +4726,7 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
     if (fileDenied) return apiError(res, 403, 'ACCOUNT_ACCESS_DENIED', 'Access denied to this file', req.requestId);
 
     res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', (req.query.preview === '1' && !meta?.isEncrypted) ? 'private, max-age=86400' : 'private, no-cache');
     const dispositionType = (meta?.isEncrypted === true) ? 'attachment' : (req.query.preview === '1' ? 'inline' : 'attachment');
 
     if (account.accountType === 'tgdrive') {
@@ -3961,9 +4736,6 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
         ? `"${meta.encryptedChecksum}"`
         : `"${meta._id}-${meta.size}"`;
       res.setHeader('ETag', etag);
-      if (req.query.preview === '1' && !meta.isEncrypted) {
-        res.setHeader('Cache-Control', 'private, max-age=86400');
-      }
       if (req.headers['if-none-match'] === etag) {
         return res.status(304).end();
       }
@@ -3988,9 +4760,8 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
 
       const isEncrypted = meta?.isEncrypted === true;
       const downloadName = isEncrypted ? (meta.opaqueRemoteName || item.name) : item.name;
-      if (isEncrypted && meta?.encryptedChecksum) {
-        res.setHeader('ETag', `"${meta.encryptedChecksum}"`);
-      }
+      const odEtag = (isEncrypted && meta?.encryptedChecksum) ? `"${meta.encryptedChecksum}"` : `"${account._id}-${fileId}-${item.size || 0}"`;
+      res.setHeader('ETag', odEtag);
       res.setHeader('Content-Disposition', `${dispositionType}; filename*=UTF-8''${encodeURIComponent(downloadName)}`);
       res.setHeader('Content-Type', isEncrypted ? 'application/octet-stream' : (item.file?.mimeType || 'application/octet-stream'));
       if (isHead) {
@@ -3999,6 +4770,7 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
       }
       const response = await axios.get(dlUrl, {
         responseType: 'stream',
+        timeout: PROVIDER_API_TIMEOUT_MS,
         headers: req.headers.range ? { Range: req.headers.range } : undefined,
         validateStatus: (status: number) => status === 200 || status === 206 || status === 416
       });
@@ -4018,9 +4790,8 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
     const file     = await drive.files.get({ fileId, fields: 'name,mimeType,size' });
     const isEncrypted = meta?.isEncrypted === true;
     const fileName = isEncrypted ? (meta.opaqueRemoteName || file.data.name || 'file') : (file.data.name || 'file');
-    if (isEncrypted && meta?.encryptedChecksum) {
-      res.setHeader('ETag', `"${meta.encryptedChecksum}"`);
-    }
+    const gdEtag = (isEncrypted && meta?.encryptedChecksum) ? `"${meta.encryptedChecksum}"` : `"${account._id}-${fileId}-${file.data.size || 0}"`;
+    res.setHeader('ETag', gdEtag);
     res.setHeader('Content-Disposition', `${dispositionType}; filename*=UTF-8''${encodeURIComponent(fileName)}`);
     res.setHeader('Content-Type', isEncrypted ? 'application/octet-stream' : (file.data.mimeType || 'application/octet-stream'));
     if (isHead) {
@@ -4047,6 +4818,7 @@ async function handleDownloadRequest(req: any, res: any, isHead = false) {
     }
     pipeUpstreamWithAbort(response.data, req, res);
   } catch (err: any) {
+    downloadSlot.release();
     console.error('Download error:', err);
     if (!res.headersSent) res.status(500).send(err.message);
   }
@@ -4621,13 +5393,109 @@ function oauthSuccessPage(service: string) {
   return `<html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;background:#f8fafc;margin:0"><div style="background:white;padding:2.5rem;border-radius:1.5rem;box-shadow:0 20px 25px -5px rgba(0,0,0,.1);text-align:center;max-width:400px;width:90%"><span style="font-size:32px">✅</span><h2 style="color:#1e1b4b;margin:.75rem 0;font-size:1.5rem">Success!</h2><p style="color:#64748b;margin-bottom:2rem">${escapeHTML(service)} linked to Cloudyte.</p><button onclick="window.close()" style="background:#4f46e5;color:white;border:none;padding:.75rem 2rem;border-radius:9999px;font-weight:600;cursor:pointer">Done</button></div><script>setTimeout(()=>window.close(),4000)</script></body></html>`;
 }
 
-// ─── Cross Account File Transfer Helper ───────────────────────────────────────
+// ─── Cross Account File Transfer & Batch Backup Helpers ───────────────────────
 type TransferProgressInfo = {
   stage: string;
   bytesProcessed: number;
   totalBytes: number;
   progressPct: number;
 };
+
+type ConflictStrategy = 'overwrite' | 'rename' | 'skip' | 'error';
+
+function buildConflictCopyName(originalName: string, index = 1): string {
+  const extIdx = originalName.lastIndexOf('.');
+  const suffix = index <= 1 ? ' (conflict copy)' : ` (conflict copy ${index})`;
+  if (extIdx > 0) {
+    return `${originalName.slice(0, extIdx)}${suffix}${originalName.slice(extIdx)}`;
+  }
+  return `${originalName}${suffix}`;
+}
+
+async function checkDestinationFileExists(
+  database: any,
+  targetAccount: any,
+  targetFolderId: string,
+  candidateName: string
+): Promise<boolean> {
+  const folder = (!targetFolderId || targetFolderId === 'root') ? '' : targetFolderId;
+  if (targetAccount.accountType === 'tgdrive') {
+    const existing = await database.collection('tg_files').findOne({
+      accountId: targetAccount._id,
+      folder,
+      name: candidateName,
+      trashed: { $ne: true },
+    });
+    return Boolean(existing);
+  }
+  const existingMeta = await database.collection('tg_files').findOne({
+    accountId: targetAccount._id,
+    folder,
+    $or: [{ name: candidateName }, { opaqueRemoteName: candidateName }],
+    trashed: { $ne: true },
+  });
+  if (existingMeta) return true;
+  if (targetAccount.accountType === 'onedrive') {
+    try {
+      const c = await getOneDriveClient(targetAccount.tokens || targetAccount.credentials, String(targetAccount._id));
+      const parentPath = (!targetFolderId || targetFolderId === 'root') ? '/me/drive/root' : `/me/drive/items/${targetFolderId}`;
+      const children = await c.api(`${parentPath}/children`).get();
+      const items = Array.isArray(children?.value) ? children.value : [];
+      return items.some((it: any) => !it.deleted && String(it.name || '') === candidateName);
+    } catch {
+      return false;
+    }
+  }
+  if (targetAccount.accountType === 'google') {
+    try {
+      const drive = await getDriveClient(targetAccount.tokens || targetAccount.credentials);
+      const safeName = escapeDriveQueryValue(candidateName);
+      const safeParent = escapeDriveQueryValue(targetFolderId || 'root');
+      const res = await drive.files.list({
+        q: `name = '${safeName}' and '${safeParent}' in parents and trashed = false`,
+        fields: 'files(id,name)',
+        pageSize: 1,
+      });
+      return Array.isArray(res?.data?.files) && res.data.files.length > 0;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+async function resolveNonConflictingFileName(
+  database: any,
+  targetAccount: any,
+  targetFolderId: string,
+  desiredName: string,
+  conflictStrategy: ConflictStrategy = 'overwrite'
+): Promise<{ resolvedName: string; conflictDetected: boolean; skipped: boolean }> {
+  if (conflictStrategy === 'overwrite') {
+    return { resolvedName: desiredName, conflictDetected: false, skipped: false };
+  }
+  const exists = await checkDestinationFileExists(database, targetAccount, targetFolderId, desiredName);
+  if (!exists) {
+    return { resolvedName: desiredName, conflictDetected: false, skipped: false };
+  }
+  if (conflictStrategy === 'skip') {
+    return { resolvedName: desiredName, conflictDetected: true, skipped: true };
+  }
+  if (conflictStrategy === 'error') {
+    const err: any = new Error(`File '${desiredName}' already exists in destination folder`);
+    err.code = STANDARD_ERROR_CODES.CONFLICT;
+    err.status = 409;
+    throw err;
+  }
+  for (let i = 1; i <= 50; i++) {
+    const candidate = buildConflictCopyName(desiredName, i);
+    const taken = await checkDestinationFileExists(database, targetAccount, targetFolderId, candidate);
+    if (!taken) {
+      return { resolvedName: candidate, conflictDetected: true, skipped: false };
+    }
+  }
+  return { resolvedName: `${Date.now()}_${desiredName}`, conflictDetected: true, skipped: false };
+}
 
 async function crossAccountTransfer(
   sourceAccountId: string,
@@ -4638,8 +5506,21 @@ async function crossAccountTransfer(
   isAdmin: boolean,
   database: any,
   isMove: boolean,
-  onProgress?: (info: TransferProgressInfo) => Promise<void> | void
+  onProgress?: (info: TransferProgressInfo) => Promise<void> | void,
+  jobId?: string,
+  shouldCancel?: () => Promise<boolean> | boolean,
+  conflictStrategy: ConflictStrategy = 'overwrite'
 ) {
+  const checkCancelled = async () => {
+    if (shouldCancel && await shouldCancel()) {
+      const err: any = new Error('Transfer job was cancelled');
+      err.code = 'JOB_CANCELLED';
+      throw err;
+    }
+  };
+
+  await checkCancelled();
+
   const { account: sourceAccount, accessDenied: srcDenied } = await resolveAuthorizedAccount(database, sourceAccountId, userId, isAdmin);
   if (srcDenied) throw new Error('Access denied to source account');
   if (!sourceAccount) throw new Error('Source account not found');
@@ -4651,141 +5532,469 @@ async function crossAccountTransfer(
   const { meta: sourceMeta, accessDenied: fileDenied } = await resolveFileMetadataForAccount(database, sourceAccount, fileId, userId, isAdmin);
   if (fileDenied) throw new Error('Access denied to source file');
 
-  const tmpPath = path.join(os.tmpdir(), `transfer_${Date.now()}_${nanoid(6)}`);
-  const writeStream = fs.createWriteStream(tmpPath);
-  
-  let fileName = sourceMeta?.isEncrypted ? (sourceMeta.opaqueRemoteName || sourceMeta.name) : 'unknown';
-  let mimeType = sourceMeta?.isEncrypted ? 'application/octet-stream' : 'application/octet-stream';
-  let expectedBytes = Number(sourceMeta?.encryptedSizeBytes ?? sourceMeta?.size ?? 0) || 0;
+  const transferIdempotencyKey = jobId
+    ? `transfer_job_${jobId}`
+    : `transfer_${sourceAccountId}_${fileId}_${targetAccountId}_${targetFolderId || 'root'}_${Date.now()}`;
+  const manifestKey = jobId || transferIdempotencyKey;
 
-  try {
-    await onProgress?.({ stage: 'downloading', bytesProcessed: 0, totalBytes: expectedBytes, progressPct: 5 });
+  // Check if a previous attempt for this job already verified destination upload or saved a provider checkpoint
+  const priorManifest = jobId
+    ? await database.collection('transfer_manifests').findOne({ jobId: manifestKey })
+    : null;
+  const existingManifest = (priorManifest && (priorManifest.status === 'destination_verified' || priorManifest.status === 'completed'))
+    ? priorManifest
+    : null;
 
-    if (sourceAccount.accountType === 'tgdrive') {
-      const meta = sourceMeta;
-      if (!meta) throw new Error('File not found in TG');
-      fileName = meta.isEncrypted ? (meta.opaqueRemoteName || meta.name) : meta.name;
-      mimeType = meta.isEncrypted ? 'application/octet-stream' : meta.mimeType;
-      expectedBytes = Number(meta.encryptedSizeBytes ?? meta.size ?? 0) || 0;
-      
-      const telegram = await getTgClient();
-      const peer = await resolvePeer(telegram, sourceAccount.channelId);
-      const messages = await telegram.getMessages(peer, { ids: [meta.messageId] });
-      if (!messages || !messages[0] || !messages[0].media) throw new Error('Message not found');
-      
-      let downloaded = 0;
-      for await (const chunk of telegram.iterDownload({ file: messages[0].media, requestSize: 1024 * 1024 })) {
-        downloaded += chunk.length;
-        if (!writeStream.write(chunk)) {
-          await new Promise<void>((res, rej) => {
-            const onDrain = () => { cleanup(); res(); };
-            const onErr = (e: any) => { cleanup(); rej(e); };
-            const cleanup = () => { writeStream.off('drain', onDrain); writeStream.off('error', onErr); };
-            writeStream.once('drain', onDrain);
-            writeStream.once('error', onErr);
-          });
-        }
-        const pct = expectedBytes > 0 ? Math.min(50, 5 + Math.round((downloaded / expectedBytes) * 45)) : 25;
-        await onProgress?.({ stage: 'downloading', bytesProcessed: downloaded, totalBytes: expectedBytes, progressPct: pct });
+  let verifiedBytes = Number(existingManifest?.sizeBytes || 0);
+  let resolvedFileName = String(existingManifest?.fileName || '');
+  let destinationFileId = String(existingManifest?.destinationFileId || '');
+  let conflictDetected = Boolean(existingManifest?.conflictDetected);
+
+  if (!existingManifest) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+    const tmpPath = path.join(TEMP_DIR, `transfer_${Date.now()}_${nanoid(6)}`);
+    const writeStream = fs.createWriteStream(tmpPath);
+
+    let fileName = sourceMeta?.isEncrypted ? (sourceMeta.opaqueRemoteName || sourceMeta.name) : 'unknown';
+    let mimeType = sourceMeta?.isEncrypted ? 'application/octet-stream' : 'application/octet-stream';
+    let expectedBytes = Number(sourceMeta?.encryptedSizeBytes ?? sourceMeta?.size ?? 0) || 0;
+
+    try {
+      if (!hasTempDiskHeadroom(expectedBytes)) {
+        const storageErr: any = new Error('Server temporary storage is too low for this transfer');
+        storageErr.code = STANDARD_ERROR_CODES.INSUFFICIENT_STORAGE;
+        throw storageErr;
       }
-      writeStream.end();
-      await new Promise<void>((res, rej) => { writeStream.on('finish', () => res()); writeStream.on('error', rej); });
-    } else if (sourceAccount.accountType === 'onedrive') {
-      const c = await getOneDriveClient(sourceAccount.tokens || sourceAccount.credentials, sourceAccount._id.toString());
-      const item = await c.api(`/me/drive/items/${fileId}`).get();
-      if (!sourceMeta?.isEncrypted) {
-        fileName = item.name;
-        mimeType = item.file?.mimeType || mimeType;
-      }
-      expectedBytes = Number(item.size) || expectedBytes;
 
-      const dlUrl = item['@microsoft.graph.downloadUrl'];
-      if (!dlUrl) throw new Error('Download link not available');
-      const response = await axios.get(dlUrl, { responseType: 'stream' });
-      await stream.promises.pipeline(response.data, writeStream);
-    } else if (sourceAccount.accountType === 'google') {
-      const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
-      const file = await drive.files.get({ fileId, fields: 'name,mimeType,size' });
-      if (!sourceMeta?.isEncrypted) {
-        fileName = file.data.name || 'unknown';
-        mimeType = file.data.mimeType || mimeType;
-      }
-      expectedBytes = Number(file.data.size) || expectedBytes;
-      
-      const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
-      await stream.promises.pipeline(response.data, writeStream);
-    }
+      await onProgress?.({ stage: 'downloading', bytesProcessed: 0, totalBytes: expectedBytes, progressPct: 5 });
 
-    const stat = await fs.promises.stat(tmpPath);
-    await onProgress?.({ stage: 'uploading', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 55 });
-
-    const encryptionSpec: ValidatedUploadSpec | undefined = sourceMeta?.isEncrypted ? {
-      isEncrypted: true,
-      fileName: sourceMeta.opaqueRemoteName || sourceMeta.name,
-      mimeType: 'application/octet-stream',
-      size: stat.size,
-      folderId: (!targetFolderId || targetFolderId === 'root') ? 'root' : targetFolderId,
-      checksum: sourceMeta.encryptedChecksum || await computeFileSha256(tmpPath),
-      encryptionFormatVersion: sourceMeta.encryptionFormatVersion ?? 1,
-      encryptionKeyId: sourceMeta.encryptionKeyId ?? null,
-      encryptedMetadata: sourceMeta.encryptedMetadata ?? null,
-      opaqueRemoteName: sourceMeta.opaqueRemoteName || sourceMeta.name,
-      encryptedSizeBytes: stat.size,
-    } : undefined;
-
-    await uploadFileToProvider(
-      targetAccount,
-      String(targetAccount._id),
-      { path: tmpPath, size: stat.size, originalname: fileName, mimetype: mimeType },
-      targetFolderId,
-      undefined,
-      undefined,
-      undefined,
-      encryptionSpec,
-      String(userId || targetAccount.userId || '')
-    );
-    await onProgress?.({ stage: 'uploading', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 90 });
-
-    if (isMove) {
-      await onProgress?.({ stage: 'finalizing', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 95 });
-      deleteThumbFiles(fileId, String(sourceAccount._id));
       if (sourceAccount.accountType === 'tgdrive') {
-        if (sourceMeta) {
-          const telegram = await getTgClient();
-          const peer = await resolvePeer(telegram, sourceAccount.channelId);
-          try { await telegram.deleteMessages(peer, [sourceMeta.messageId], { revoke: true }); } catch { /* ignore */ }
-          await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
+        const meta = sourceMeta;
+        if (!meta) throw new Error('File not found in TG');
+        fileName = meta.isEncrypted ? (meta.opaqueRemoteName || meta.name) : meta.name;
+        mimeType = meta.isEncrypted ? 'application/octet-stream' : meta.mimeType;
+        expectedBytes = Number(meta.encryptedSizeBytes ?? meta.size ?? 0) || 0;
+
+        const telegram = await getTgClient();
+        const peer = await resolvePeer(telegram, sourceAccount.channelId);
+        const messages = await telegram.getMessages(peer, { ids: [meta.messageId] });
+        if (!messages || !messages[0] || !messages[0].media) throw new Error('Message not found');
+
+        let downloaded = 0;
+        for await (const chunk of telegram.iterDownload({ file: messages[0].media, requestSize: 1024 * 1024 })) {
+          await checkCancelled();
+          downloaded += chunk.length;
+          if (!writeStream.write(chunk)) {
+            await new Promise<void>((res, rej) => {
+              const onDrain = () => { cleanup(); res(); };
+              const onErr = (e: any) => { cleanup(); rej(e); };
+              const cleanup = () => { writeStream.off('drain', onDrain); writeStream.off('error', onErr); };
+              writeStream.once('drain', onDrain);
+              writeStream.once('error', onErr);
+            });
+          }
+          const pct = expectedBytes > 0 ? Math.min(50, 5 + Math.round((downloaded / expectedBytes) * 45)) : 25;
+          await onProgress?.({ stage: 'downloading', bytesProcessed: downloaded, totalBytes: expectedBytes, progressPct: pct });
         }
+        writeStream.end();
+        await new Promise<void>((res, rej) => { writeStream.on('finish', () => res()); writeStream.on('error', rej); });
       } else if (sourceAccount.accountType === 'onedrive') {
         const c = await getOneDriveClient(sourceAccount.tokens || sourceAccount.credentials, sourceAccount._id.toString());
-        await c.api(`/me/drive/items/${fileId}`).delete();
-        if (sourceMeta) await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
+        const item = await c.api(`/me/drive/items/${fileId}`).get();
+        if (!sourceMeta?.isEncrypted) {
+          fileName = item.name;
+          mimeType = item.file?.mimeType || mimeType;
+        }
+        expectedBytes = Number(item.size) || expectedBytes;
+
+        const dlUrl = item['@microsoft.graph.downloadUrl'];
+        if (!dlUrl) throw new Error('Download link not available');
+        const response = await axios.get(dlUrl, { responseType: 'stream', timeout: PROVIDER_API_TIMEOUT_MS });
+        await stream.promises.pipeline(response.data, writeStream);
       } else if (sourceAccount.accountType === 'google') {
         const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
-        await drive.files.delete({ fileId });
-        if (sourceMeta) await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
-      }
-    }
+        const file = await drive.files.get({ fileId, fields: 'name,mimeType,size' });
+        if (!sourceMeta?.isEncrypted) {
+          fileName = file.data.name || 'unknown';
+          mimeType = file.data.mimeType || mimeType;
+        }
+        expectedBytes = Number(file.data.size) || expectedBytes;
 
-    await onProgress?.({ stage: 'completed', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 100 });
-  } finally {
-    try { writeStream.destroy(); } catch { /* ignore */ }
-    try { await fs.promises.unlink(tmpPath); } catch { /* ignore */ }
+        const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+        await stream.promises.pipeline(response.data, writeStream);
+      }
+
+      await checkCancelled();
+      const stat = await fs.promises.stat(tmpPath);
+      if (expectedBytes > 0 && stat.size !== expectedBytes) {
+        throw new Error(`Downloaded size (${stat.size}) does not match expected source size (${expectedBytes})`);
+      }
+      verifiedBytes = stat.size;
+      const transferChecksum = sourceMeta?.encryptedChecksum || await computeFileSha256(tmpPath);
+
+      const conflictResolution = await resolveNonConflictingFileName(
+        database,
+        targetAccount,
+        targetFolderId,
+        fileName,
+        conflictStrategy
+      );
+      if (conflictResolution.skipped) {
+        const skippedNow = new Date();
+        await database.collection('transfer_manifests').updateOne(
+          { jobId: manifestKey },
+          {
+            $set: {
+              jobId: manifestKey,
+              userId: userId ? String(userId) : null,
+              sourceAccountId: String(sourceAccountId),
+              sourceFileId: String(fileId),
+              targetAccountId: String(targetAccountId),
+              targetFolderId: String(targetFolderId || 'root'),
+              fileName,
+              resolvedFileName: fileName,
+              conflictDetected: true,
+              skipped: true,
+              sizeBytes: stat.size,
+              checksum: transferChecksum,
+              isMove: false,
+              status: 'skipped_conflict',
+              completedAt: skippedNow,
+              updatedAt: skippedNow,
+            },
+            $setOnInsert: { createdAt: skippedNow },
+          },
+          { upsert: true }
+        );
+        await onProgress?.({ stage: 'completed', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 100 });
+        return { skipped: true, conflictDetected: true, fileName, resolvedFileName: fileName };
+      }
+
+      resolvedFileName = conflictResolution.resolvedName;
+      conflictDetected = conflictResolution.conflictDetected;
+
+      await onProgress?.({ stage: 'uploading', bytesProcessed: 0, totalBytes: stat.size, progressPct: 55 });
+
+      const encryptionSpec: ValidatedUploadSpec | undefined = sourceMeta?.isEncrypted ? {
+        isEncrypted: true,
+        fileName: resolvedFileName,
+        mimeType: 'application/octet-stream',
+        size: stat.size,
+        folderId: (!targetFolderId || targetFolderId === 'root') ? 'root' : targetFolderId,
+        checksum: transferChecksum,
+        encryptionFormatVersion: sourceMeta.encryptionFormatVersion ?? 1,
+        encryptionKeyId: sourceMeta.encryptionKeyId ?? null,
+        encryptedMetadata: sourceMeta.encryptedMetadata ?? null,
+        opaqueRemoteName: resolvedFileName,
+        encryptedSizeBytes: stat.size,
+      } : undefined;
+
+      // Persist upstream provider resumable upload session (OneDrive nextExpectedRanges / Google resumable URI)
+      const priorProviderSession: PersistedProviderSession | undefined = priorManifest?.providerSession || undefined;
+      const persistProviderSession = async (sessionState: PersistedProviderSession) => {
+        await checkCancelled();
+        const checkpointNow = new Date();
+        await database.collection('transfer_manifests').updateOne(
+          { jobId: manifestKey },
+          {
+            $set: {
+              jobId: manifestKey,
+              userId: userId ? String(userId) : null,
+              sourceAccountId: String(sourceAccountId),
+              sourceFileId: String(fileId),
+              targetAccountId: String(targetAccountId),
+              targetFolderId: String(targetFolderId || 'root'),
+              fileName,
+              resolvedFileName,
+              conflictDetected,
+              sizeBytes: stat.size,
+              checksum: transferChecksum,
+              isMove: Boolean(isMove),
+              providerSession: sessionState,
+              status: 'uploading',
+              updatedAt: checkpointNow,
+            },
+            $setOnInsert: { createdAt: checkpointNow },
+          },
+          { upsert: true }
+        );
+        const uploadedBytes = Math.min(stat.size, Number(sessionState.nextOffset || 0));
+        const pct = stat.size > 0 ? Math.min(90, 55 + Math.round((uploadedBytes / stat.size) * 35)) : 75;
+        await onProgress?.({ stage: 'uploading', bytesProcessed: uploadedBytes, totalBytes: stat.size, progressPct: pct });
+      };
+
+      const useResumableProviderSession = Boolean(priorProviderSession) || stat.size > 4 * 1024 * 1024;
+      const uploadResult: any = await uploadFileToProvider(
+        targetAccount,
+        String(targetAccount._id),
+        { path: tmpPath, size: stat.size, originalname: resolvedFileName, mimetype: mimeType },
+        targetFolderId,
+        useResumableProviderSession ? priorProviderSession : undefined,
+        useResumableProviderSession ? persistProviderSession : undefined,
+        transferIdempotencyKey,
+        encryptionSpec,
+        String(userId || targetAccount.userId || '')
+      );
+
+      // Verify destination success before ever deleting source on move
+      const destinationConfirmed = uploadResult !== undefined && uploadResult !== null && (
+        Boolean(uploadResult.id) ||
+        Boolean(uploadResult._id) ||
+        Boolean(uploadResult.messageId) ||
+        uploadResult.success === true ||
+        typeof uploadResult === 'object'
+      );
+      if (!destinationConfirmed) {
+        throw new Error('Destination provider did not confirm file upload completion');
+      }
+
+      destinationFileId = String(uploadResult?.id || uploadResult?._id || uploadResult?.messageId || resolvedFileName);
+      const manifestNow = new Date();
+      await database.collection('transfer_manifests').updateOne(
+        { jobId: manifestKey },
+        {
+          $set: {
+            jobId: manifestKey,
+            userId: userId ? String(userId) : null,
+            sourceAccountId: String(sourceAccountId),
+            sourceFileId: String(fileId),
+            targetAccountId: String(targetAccountId),
+            targetFolderId: String(targetFolderId || 'root'),
+            destinationFileId,
+            fileName,
+            resolvedFileName,
+            conflictDetected,
+            sizeBytes: stat.size,
+            checksum: transferChecksum,
+            isMove: Boolean(isMove),
+            status: 'destination_verified',
+            verified: true,
+            verifiedAt: manifestNow,
+            updatedAt: manifestNow,
+          },
+          $setOnInsert: { createdAt: manifestNow },
+        },
+        { upsert: true }
+      );
+
+      await onProgress?.({ stage: 'uploading', bytesProcessed: stat.size, totalBytes: stat.size, progressPct: 90 });
+    } finally {
+      try { writeStream.destroy(); } catch { /* ignore */ }
+      try { await fs.promises.unlink(tmpPath); } catch { /* ignore */ }
+    }
   }
+
+  if (isMove) {
+    await checkCancelled();
+    await onProgress?.({ stage: 'finalizing', bytesProcessed: verifiedBytes, totalBytes: verifiedBytes, progressPct: 95 });
+    deleteThumbFiles(fileId, String(sourceAccount._id));
+    if (sourceAccount.accountType === 'tgdrive') {
+      if (sourceMeta) {
+        const telegram = await getTgClient();
+        const peer = await resolvePeer(telegram, sourceAccount.channelId);
+        try { await telegram.deleteMessages(peer, [sourceMeta.messageId], { revoke: true }); } catch { /* ignore */ }
+        await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
+      }
+    } else if (sourceAccount.accountType === 'onedrive') {
+      const c = await getOneDriveClient(sourceAccount.tokens || sourceAccount.credentials, sourceAccount._id.toString());
+      await c.api(`/me/drive/items/${fileId}`).delete();
+      if (sourceMeta) await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
+    } else if (sourceAccount.accountType === 'google') {
+      const drive = await getDriveClient(sourceAccount.tokens || sourceAccount.credentials);
+      await drive.files.delete({ fileId });
+      if (sourceMeta) await database.collection('tg_files').deleteOne({ _id: sourceMeta._id });
+    }
+  }
+
+  if (jobId) {
+    await database.collection('transfer_manifests').updateOne(
+      { jobId },
+      { $set: { status: 'completed', completedAt: new Date(), updatedAt: new Date() } }
+    );
+  }
+  await onProgress?.({ stage: 'completed', bytesProcessed: verifiedBytes, totalBytes: verifiedBytes, progressPct: 100 });
+  return {
+    skipped: false,
+    conflictDetected,
+    destinationFileId,
+    resolvedFileName,
+    sizeBytes: verifiedBytes,
+  };
 }
 
-async function enqueueTransferJob(database: any, payload: any) {
+async function verifySingleBackupItem(database: any, targetAccount: any, item: any): Promise<boolean> {
+  if (!item || item.skipped) return true;
+  if (targetAccount.accountType === 'tgdrive') {
+    const query: any = { accountId: targetAccount._id, trashed: { $ne: true } };
+    if (item.destinationFileId && ObjectId.isValid(item.destinationFileId)) {
+      query._id = new ObjectId(item.destinationFileId);
+    } else {
+      query.name = item.resolvedFileName || item.fileName;
+    }
+    const doc = await database.collection('tg_files').findOne(query);
+    if (!doc) return false;
+    const docSize = Number(doc.encryptedSizeBytes ?? doc.size ?? 0);
+    return item.sizeBytes > 0 ? docSize === Number(item.sizeBytes) : true;
+  }
+  return Boolean(item.destinationFileId);
+}
+
+async function executeBatchBackupOrRestore(
+  job: any,
+  database: any,
+  shouldCancel: () => Promise<boolean>
+) {
+  const p = job.payload || {};
+  const sourceAccountId = String(p.sourceAccountId || '');
+  const targetAccountId = String(p.targetAccountId || '');
+  const targetFolderId = String(p.targetFolderId || 'root');
+  const fileIds: string[] = Array.isArray(p.fileIds) ? p.fileIds.map(String) : [];
+  const conflictStrategy: ConflictStrategy = p.conflictStrategy || 'rename';
+  const jobId = String(job._id);
+
+  const { account: targetAccount } = await resolveAuthorizedAccount(database, targetAccountId, p.userId, p.isAdmin);
+  if (!targetAccount) throw new Error('Target account not found');
+
+  const priorManifest = await database.collection('transfer_manifests').findOne({ jobId });
+  const completedMap = new Map<string, any>();
+  if (Array.isArray(priorManifest?.items)) {
+    for (const it of priorManifest.items) {
+      if (it?.sourceFileId && (it.status === 'completed' || it.status === 'skipped_conflict')) {
+        completedMap.set(String(it.sourceFileId), it);
+      }
+    }
+  }
+
+  const items: any[] = [];
+  const failedFiles: any[] = [];
+  const totalFiles = Math.max(1, fileIds.length);
+
+  for (let idx = 0; idx < fileIds.length; idx++) {
+    if (await shouldCancel()) {
+      const err: any = new Error('Batch job was cancelled');
+      err.code = 'JOB_CANCELLED';
+      throw err;
+    }
+    const fId = fileIds[idx];
+    if (completedMap.has(fId)) {
+      items.push(completedMap.get(fId));
+      continue;
+    }
+    const subJobKey = `${jobId}_item_${idx}_${fId}`;
+    try {
+      const res = await crossAccountTransfer(
+        sourceAccountId,
+        fId,
+        targetAccountId,
+        targetFolderId,
+        p.userId,
+        Boolean(p.isAdmin),
+        database,
+        false,
+        undefined,
+        subJobKey,
+        shouldCancel,
+        conflictStrategy
+      );
+      const subManifest = await database.collection('transfer_manifests').findOne({ jobId: subJobKey });
+      const itemRecord = {
+        sourceFileId: fId,
+        destinationFileId: res?.destinationFileId || subManifest?.destinationFileId || null,
+        fileName: subManifest?.fileName || fId,
+        resolvedFileName: res?.resolvedFileName || subManifest?.resolvedFileName || subManifest?.fileName || fId,
+        conflictDetected: Boolean(res?.conflictDetected || subManifest?.conflictDetected),
+        skipped: Boolean(res?.skipped),
+        sizeBytes: Number(res?.sizeBytes ?? subManifest?.sizeBytes ?? 0),
+        checksum: subManifest?.checksum || null,
+        status: res?.skipped ? 'skipped_conflict' : 'completed',
+      };
+      const verified = await verifySingleBackupItem(database, targetAccount, itemRecord);
+      items.push({ ...itemRecord, verified });
+      if (!verified) {
+        failedFiles.push({ fileId: fId, error: 'Post-backup destination verification failed' });
+      }
+    } catch (itemErr: any) {
+      if (itemErr?.code === 'JOB_CANCELLED') throw itemErr;
+      // Partial-failure resilience: record individual file failure and continue the batch
+      failedFiles.push({
+        fileId: fId,
+        error: itemErr?.message || 'File backup failed',
+        code: itemErr?.code || STANDARD_ERROR_CODES.TRANSFER_FAILED,
+      });
+      items.push({
+        sourceFileId: fId,
+        status: 'failed',
+        error: itemErr?.message || 'File backup failed',
+        verified: false,
+      });
+    }
+
+    const progressPct = Math.min(95, Math.round(((idx + 1) / totalFiles) * 95));
+    const now = new Date();
+    await database.collection('jobs').updateOne(
+      { _id: job._id, status: 'running' },
+      {
+        $set: {
+          stage: `processed_${idx + 1}_of_${fileIds.length}`,
+          progressPct,
+          leaseUntil: new Date(Date.now() + JOB_LEASE_MS),
+          updatedAt: now,
+        },
+      }
+    );
+    await database.collection('transfer_manifests').updateOne(
+      { jobId },
+      {
+        $set: {
+          jobId,
+          type: job.type,
+          userId: p.userId ? String(p.userId) : null,
+          sourceAccountId,
+          targetAccountId,
+          targetFolderId,
+          conflictStrategy,
+          items,
+          failedFiles,
+          succeededCount: items.filter((i) => i.status === 'completed' || i.status === 'skipped_conflict').length,
+          failedCount: failedFiles.length,
+          verified: failedFiles.length === 0 && items.every((i) => i.verified !== false),
+          verifiedAt: new Date(),
+          status: failedFiles.length === 0 ? 'completed' : (items.some((i) => i.status === 'completed') ? 'completed_with_errors' : 'failed'),
+          updatedAt: now,
+        },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true }
+    );
+  }
+
+  invalidateDriveCache(sourceAccountId);
+  invalidateDriveCache(targetAccountId);
+}
+
+async function enqueueTransferJob(database: any, payload: any, jobType: 'cross_account_transfer' | 'batch_backup' | 'batch_restore' = 'cross_account_transfer') {
+  const activeCount = await database.collection('jobs').countDocuments({ status: { $in: ['queued', 'running'] } });
+  if (activeCount >= MAX_JOB_QUEUE_DEPTH) {
+    const err: any = new Error('Background transfer queue is currently full; please try again shortly');
+    err.status = 503;
+    err.code = STANDARD_ERROR_CODES.RATE_LIMITED;
+    throw err;
+  }
   const now = new Date();
   const job = {
     _id: nanoid(32),
-    type: 'cross_account_transfer',
+    type: jobType,
     status: 'queued',
     stage: 'queued',
+    priority: Number(payload?.priority || 0),
     progressPct: 0,
     bytesProcessed: 0,
     totalBytes: 0,
     attempts: 0,
     maxAttempts: JOB_MAX_ATTEMPTS,
+    deadLettered: false,
+    cancelRequested: false,
+    leaseOwner: null,
     payload,
     createdAt: now,
     updatedAt: now,
@@ -4802,10 +6011,13 @@ function publicJob(job: any) {
     type: job.type,
     status: job.status,
     stage: job.stage || job.status,
+    priority: job.priority || 0,
     progressPct: typeof job.progressPct === 'number' ? job.progressPct : (job.status === 'completed' ? 100 : 0),
     bytesProcessed: job.bytesProcessed || 0,
     totalBytes: job.totalBytes || 0,
     attempts: job.attempts || 0,
+    maxAttempts: job.maxAttempts || JOB_MAX_ATTEMPTS,
+    deadLettered: Boolean(job.deadLettered),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
@@ -4814,61 +6026,88 @@ function publicJob(job: any) {
   };
 }
 
-let jobWorkerRunning = false;
+const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 3));
+let activeJobWorkers = 0;
 async function runJobWorker() {
-  if (jobWorkerRunning || !db) return;
-  jobWorkerRunning = true;
+  if (activeJobWorkers >= MAX_CONCURRENT_JOBS || isShuttingDown || !db) return;
+  activeJobWorkers++;
   try {
     const now = new Date();
     const claimedResult = await db.collection('jobs').findOneAndUpdate(
       {
-        type: 'cross_account_transfer',
+        type: { $in: ['cross_account_transfer', 'batch_backup', 'batch_restore'] },
         $or: [
           { status: 'queued', nextRunAt: { $lte: now } },
           { status: 'running', leaseUntil: { $lt: now } },
         ],
       },
       {
-        $set: { status: 'running', stage: 'starting', startedAt: now, updatedAt: now, leaseUntil: new Date(Date.now() + JOB_LEASE_MS) },
+        $set: {
+          status: 'running',
+          stage: 'starting',
+          leaseOwner: WORKER_ID,
+          startedAt: now,
+          updatedAt: now,
+          leaseUntil: new Date(Date.now() + JOB_LEASE_MS),
+        },
         $inc: { attempts: 1 },
       },
-      { sort: { createdAt: 1 }, returnDocument: 'after' }
+      { sort: { priority: -1, createdAt: 1 }, returnDocument: 'after' }
     ) as any;
     const job = claimedResult?.value ?? claimedResult;
     if (!job) return;
+    if (activeJobWorkers < MAX_CONCURRENT_JOBS && !isShuttingDown) {
+      Promise.resolve().then(() => runJobWorker()).catch(() => {});
+    }
 
     try {
       const p = job.payload;
       let lastUpdateMs = 0;
-      await providerLimit(`transfer:${p.sourceAccountId}:${p.targetAccountId}`, 1)(() =>
-        crossAccountTransfer(
-          p.sourceAccountId,
-          p.fileId,
-          p.targetAccountId,
-          p.targetFolderId,
-          p.userId,
-          p.isAdmin,
-          db,
-          p.isMove,
-          async (info) => {
-            const nowMs = Date.now();
-            if (info.progressPct < 100 && nowMs - lastUpdateMs < 200) return;
-            lastUpdateMs = nowMs;
-            await db.collection('jobs').updateOne(
-              { _id: job._id },
-              {
-                $set: {
-                  stage: info.stage,
-                  progressPct: info.progressPct,
-                  bytesProcessed: info.bytesProcessed,
-                  totalBytes: info.totalBytes,
-                  updatedAt: new Date(nowMs),
-                },
-              }
-            );
-          }
-        )
-      );
+      const shouldCancel = async () => {
+        if (isShuttingDown) return false;
+        const current = await db.collection('jobs').findOne({ _id: job._id });
+        return !current || current.status === 'cancelled' || current.cancelRequested === true;
+      };
+      if (job.type === 'batch_backup' || job.type === 'batch_restore') {
+        await providerLimit(`transfer:${p.sourceAccountId}:${p.targetAccountId}`, 1)(() =>
+          executeBatchBackupOrRestore(job, db, shouldCancel)
+        );
+      } else {
+        await providerLimit(`transfer:${p.sourceAccountId}:${p.targetAccountId}`, 1)(() =>
+          crossAccountTransfer(
+            p.sourceAccountId,
+            p.fileId,
+            p.targetAccountId,
+            p.targetFolderId,
+            p.userId,
+            p.isAdmin,
+            db,
+            p.isMove,
+            async (info) => {
+              const nowMs = Date.now();
+              if (info.progressPct < 100 && nowMs - lastUpdateMs < 200) return;
+              lastUpdateMs = nowMs;
+              await db.collection('jobs').updateOne(
+                { _id: job._id, status: 'running' },
+                {
+                  $set: {
+                    stage: info.stage,
+                    progressPct: info.progressPct,
+                    bytesProcessed: info.bytesProcessed,
+                    totalBytes: info.totalBytes,
+                    leaseUntil: new Date(nowMs + JOB_LEASE_MS),
+                    updatedAt: new Date(nowMs),
+                  },
+                }
+              );
+            },
+            String(job._id),
+            shouldCancel,
+            p.conflictStrategy || 'overwrite'
+          )
+        );
+      }
+      systemMetrics.transfersCompleted++;
       invalidateDriveCache(p.sourceAccountId);
       invalidateDriveCache(p.targetAccountId);
       await db.collection('jobs').updateOne(
@@ -4881,25 +6120,197 @@ async function runJobWorker() {
             completedAt: new Date(),
             updatedAt: new Date(),
           },
-          $unset: { leaseUntil: '' },
+          $unset: { leaseUntil: '', leaseOwner: '' },
         }
       );
     } catch (err: any) {
+      if (err?.code === 'JOB_CANCELLED') {
+        await db.collection('jobs').updateOne(
+          { _id: job._id },
+          {
+            $set: { status: 'cancelled', stage: 'cancelled', error: 'Job cancelled by user', updatedAt: new Date() },
+            $unset: { leaseUntil: '', leaseOwner: '' },
+          }
+        );
+        return;
+      }
       const attempts = Number(job.attempts || 1);
-      const retry = attempts < Number(job.maxAttempts || JOB_MAX_ATTEMPTS);
+      const maxAttempts = Number(job.maxAttempts || JOB_MAX_ATTEMPTS);
+      const retry = attempts < maxAttempts;
+      if (!retry) {
+        systemMetrics.transfersFailed++;
+        systemMetrics.jobsDeadLettered++;
+      }
       await db.collection('jobs').updateOne(
         { _id: job._id, status: 'running' },
         retry
-          ? { $set: { status: 'queued', stage: 'retrying', error: err.message || 'Transfer failed', nextRunAt: new Date(Date.now() + Math.min(60, 2 ** attempts) * 1000), updatedAt: new Date() }, $unset: { leaseUntil: '' } }
-          : { $set: { status: 'failed', stage: 'failed', error: err.message || 'Transfer failed', updatedAt: new Date() }, $unset: { leaseUntil: '' } }
+          ? {
+              $set: {
+                status: 'queued',
+                stage: 'retrying',
+                error: err.message || 'Transfer failed',
+                nextRunAt: new Date(Date.now() + Math.min(60, 2 ** attempts) * 1000),
+                updatedAt: new Date(),
+              },
+              $unset: { leaseUntil: '', leaseOwner: '' },
+            }
+          : {
+              $set: {
+                status: 'failed',
+                stage: 'failed',
+                deadLettered: true,
+                deadLetteredAt: new Date(),
+                error: err.message || 'Transfer failed',
+                updatedAt: new Date(),
+              },
+              $unset: { leaseUntil: '', leaseOwner: '' },
+            }
       );
     }
   } catch (err) {
     console.error('[Jobs] Worker error:', err);
   } finally {
-    jobWorkerRunning = false;
+    activeJobWorkers = Math.max(0, activeJobWorkers - 1);
   }
 }
+
+// ─── Batch Backup, Verification, and Non-Destructive Restore Endpoints ────────
+app.post('/api/backups/batch', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const { sourceAccountId, targetAccountId, targetFolderId, fileIds, conflictStrategy } = req.body || {};
+  if (!sourceAccountId || !targetAccountId || !Array.isArray(fileIds) || fileIds.length === 0) {
+    return apiError(res, 400, STANDARD_ERROR_CODES.BAD_REQUEST, 'sourceAccountId, targetAccountId, and non-empty fileIds array are required', req.requestId);
+  }
+  const { account: srcAcc, accessDenied: srcDenied } = await resolveAuthorizedAccount(database, String(sourceAccountId), req.userId, req.isAdmin);
+  if (srcDenied) return apiError(res, 403, STANDARD_ERROR_CODES.FORBIDDEN, 'Access denied to source account', req.requestId);
+  if (!srcAcc) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Source account not found', req.requestId);
+
+  const { account: tgtAcc, accessDenied: tgtDenied } = await resolveAuthorizedAccount(database, String(targetAccountId), req.userId, req.isAdmin);
+  if (tgtDenied) return apiError(res, 403, STANDARD_ERROR_CODES.FORBIDDEN, 'Access denied to target account', req.requestId);
+  if (!tgtAcc) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Target account not found', req.requestId);
+
+  try {
+    const job = await enqueueTransferJob(database, {
+      sourceAccountId: String(sourceAccountId),
+      targetAccountId: String(targetAccountId),
+      targetFolderId: String(targetFolderId || 'root'),
+      fileIds: fileIds.map(String),
+      conflictStrategy: (['rename', 'skip', 'overwrite', 'error'].includes(conflictStrategy) ? conflictStrategy : 'rename') as ConflictStrategy,
+      userId: req.userId,
+      isAdmin: req.isAdmin,
+    }, 'batch_backup');
+    runJobWorker().catch(() => {});
+    return res.status(202).json({ success: true, async: true, jobId: job._id, status: job.status });
+  } catch (err: any) {
+    return apiError(res, err.status || 500, err.code || STANDARD_ERROR_CODES.INTERNAL_ERROR, err.message || 'Failed to enqueue batch backup', req.requestId);
+  }
+});
+
+app.post('/api/backups/:jobId/verify', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const manifest = await database.collection('transfer_manifests').findOne({ jobId: req.params.jobId });
+  if (!manifest) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Backup manifest not found', req.requestId);
+  if (!req.isAdmin && String(manifest.userId || '') !== String(req.userId || '')) {
+    return apiError(res, 403, STANDARD_ERROR_CODES.FORBIDDEN, 'Access denied to this backup manifest', req.requestId);
+  }
+  const { account: targetAccount } = await resolveAuthorizedAccount(database, String(manifest.targetAccountId), req.userId, req.isAdmin);
+  if (!targetAccount) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Target account not found', req.requestId);
+
+  const items: any[] = Array.isArray(manifest.items)
+    ? manifest.items
+    : [{
+        sourceFileId: manifest.sourceFileId,
+        destinationFileId: manifest.destinationFileId,
+        fileName: manifest.fileName,
+        resolvedFileName: manifest.resolvedFileName || manifest.fileName,
+        sizeBytes: manifest.sizeBytes,
+        status: manifest.status,
+      }];
+
+  let verifiedCount = 0;
+  const failedVerifications: any[] = [];
+  for (const item of items) {
+    if (item.status === 'failed') {
+      failedVerifications.push({ fileId: item.sourceFileId, reason: item.error || 'Upload failed during backup' });
+      continue;
+    }
+    const ok = await verifySingleBackupItem(database, targetAccount, item);
+    if (ok) verifiedCount++;
+    else failedVerifications.push({ fileId: item.sourceFileId, destinationFileId: item.destinationFileId, reason: 'Destination file missing or size mismatch' });
+  }
+
+  const allVerified = failedVerifications.length === 0 && verifiedCount === items.length;
+  const verifiedAt = new Date();
+  await database.collection('transfer_manifests').updateOne(
+    { jobId: req.params.jobId },
+    { $set: { verified: allVerified, verifiedAt, updatedAt: verifiedAt } }
+  );
+
+  return res.json({
+    jobId: req.params.jobId,
+    verified: allVerified,
+    totalItems: items.length,
+    verifiedCount,
+    failedVerifications,
+    verifiedAt: verifiedAt.toISOString(),
+  });
+});
+
+app.post('/api/backups/:jobId/restore', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const manifest = await database.collection('transfer_manifests').findOne({ jobId: req.params.jobId });
+  if (!manifest) return apiError(res, 404, STANDARD_ERROR_CODES.NOT_FOUND, 'Backup manifest not found', req.requestId);
+  if (!req.isAdmin && String(manifest.userId || '') !== String(req.userId || '')) {
+    return apiError(res, 403, STANDARD_ERROR_CODES.FORBIDDEN, 'Access denied to this backup manifest', req.requestId);
+  }
+  const restoreTargetAccountId = String(req.body?.targetAccountId || manifest.sourceAccountId);
+  const restoreTargetFolderId = String(req.body?.targetFolderId || 'root');
+  // Never overwrite existing files silently during restore: default to 'rename' (conflict copies)
+  const conflictStrategy: ConflictStrategy = (['rename', 'skip', 'error', 'overwrite'].includes(req.body?.conflictStrategy)
+    ? req.body.conflictStrategy
+    : 'rename') as ConflictStrategy;
+
+  const items: any[] = Array.isArray(manifest.items)
+    ? manifest.items.filter((i: any) => i.destinationFileId && i.status === 'completed')
+    : (manifest.destinationFileId ? [{ destinationFileId: manifest.destinationFileId }] : []);
+  const restoreFileIds = items.map((i: any) => String(i.destinationFileId));
+  if (restoreFileIds.length === 0) {
+    return apiError(res, 409, STANDARD_ERROR_CODES.CONFLICT, 'No completed backup files available to restore', req.requestId);
+  }
+
+  try {
+    const job = await enqueueTransferJob(database, {
+      sourceAccountId: String(manifest.targetAccountId),
+      targetAccountId: restoreTargetAccountId,
+      targetFolderId: restoreTargetFolderId,
+      fileIds: restoreFileIds,
+      conflictStrategy,
+      userId: req.userId,
+      isAdmin: req.isAdmin,
+    }, 'batch_restore');
+    runJobWorker().catch(() => {});
+    return res.status(202).json({
+      success: true,
+      async: true,
+      jobId: job._id,
+      status: job.status,
+      conflictStrategy,
+    });
+  } catch (err: any) {
+    return apiError(res, err.status || 500, err.code || STANDARD_ERROR_CODES.INTERNAL_ERROR, err.message || 'Failed to enqueue restore job', req.requestId);
+  }
+});
+
+app.get('/api/jobs', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const query: any = {};
+  if (!req.isAdmin && req.userId) query['payload.userId'] = String(req.userId);
+  if (typeof req.query.status === 'string' && req.query.status.trim()) {
+    query.status = req.query.status.trim();
+  }
+  const jobs = await database.collection('jobs').find(query).sort({ createdAt: -1 }).limit(50).toArray();
+  res.json(jobs.map(publicJob));
+});
 
 app.get('/api/jobs/:jobId', requireAuth, async (req: any, res: any) => {
   const database = req.db || db || await connectToMongo();
@@ -4908,6 +6319,33 @@ app.get('/api/jobs/:jobId', requireAuth, async (req: any, res: any) => {
   const job = await database.collection('jobs').findOne(query);
   if (!job) return apiError(res, 404, 'JOB_NOT_FOUND', 'Job not found', req.requestId);
   res.json(publicJob(job));
+});
+
+app.post('/api/jobs/:jobId/cancel', requireAuth, async (req: any, res: any) => {
+  const database = req.db || db || await connectToMongo();
+  const query: any = { _id: req.params.jobId };
+  if (!req.isAdmin && req.userId) query['payload.userId'] = String(req.userId);
+  const existing = await database.collection('jobs').findOne(query);
+  if (!existing) return apiError(res, 404, 'JOB_NOT_FOUND', 'Job not found', req.requestId);
+  if (existing.status === 'completed') {
+    return apiError(res, 409, STANDARD_ERROR_CODES.CONFLICT, 'Completed job cannot be cancelled', req.requestId);
+  }
+  const now = new Date();
+  await database.collection('jobs').updateOne(
+    { _id: existing._id },
+    {
+      $set: {
+        status: 'cancelled',
+        stage: 'cancelled',
+        cancelRequested: true,
+        error: 'Job cancelled by user',
+        updatedAt: now,
+      },
+      $unset: { leaseUntil: '', leaseOwner: '' },
+    }
+  );
+  const updated = await database.collection('jobs').findOne({ _id: existing._id });
+  res.json(publicJob(updated || { ...existing, status: 'cancelled', stage: 'cancelled' }));
 });
 
 app.get('/api/jobs/:jobId/stream', requireAuth, async (req: any, res: any) => {
@@ -4929,7 +6367,7 @@ app.get('/api/jobs/:jobId/stream', requireAuth, async (req: any, res: any) => {
   };
 
   sendEvent(initialJob);
-  if (initialJob.status === 'completed' || initialJob.status === 'failed') {
+  if (initialJob.status === 'completed' || initialJob.status === 'failed' || initialJob.status === 'cancelled') {
     return res.end();
   }
 
@@ -4951,7 +6389,7 @@ app.get('/api/jobs/:jobId/stream', requireAuth, async (req: any, res: any) => {
         if (!res.writableEnded) res.end();
         return;
       }
-      if (current.status === 'queued' && !jobWorkerRunning) {
+      if (current.status === 'queued' && activeJobWorkers < MAX_CONCURRENT_JOBS) {
         runJobWorker().catch(() => {});
       }
       const snap = `${current.status}:${current.stage}:${current.progressPct}`;
@@ -4959,7 +6397,7 @@ app.get('/api/jobs/:jobId/stream', requireAuth, async (req: any, res: any) => {
         lastSnapshot = snap;
         sendEvent(current);
       }
-      if (current.status === 'completed' || current.status === 'failed') {
+      if (current.status === 'completed' || current.status === 'failed' || current.status === 'cancelled') {
         clearInterval(pollTimer);
         if (!res.writableEnded) res.end();
       }
@@ -4977,11 +6415,22 @@ app.get('/api/jobs/:jobId/stream', requireAuth, async (req: any, res: any) => {
 
 app.post('/api/jobs/:jobId/retry', requireAuth, async (req: any, res: any) => {
   const database = req.db || db || await connectToMongo();
-  const query: any = { _id: req.params.jobId, status: 'failed' };
+  const query: any = { _id: req.params.jobId, status: { $in: ['failed', 'cancelled'] } };
   if (!req.isAdmin && req.userId) query['payload.userId'] = String(req.userId);
   const result = await database.collection('jobs').findOneAndUpdate(
     query,
-    { $set: { status: 'queued', stage: 'queued', progressPct: 0, nextRunAt: new Date(), updatedAt: new Date() }, $unset: { error: '', leaseUntil: '' } },
+    {
+      $set: {
+        status: 'queued',
+        stage: 'queued',
+        progressPct: 0,
+        deadLettered: false,
+        cancelRequested: false,
+        nextRunAt: new Date(),
+        updatedAt: new Date(),
+      },
+      $unset: { error: '', leaseUntil: '', leaseOwner: '', deadLetteredAt: '' },
+    },
     { returnDocument: 'after' }
   ) as any;
   const job = result?.value ?? result;
@@ -5027,21 +6476,46 @@ if (process.env.CLOUDYTE_TEST_MODE !== '1') {
 
 // ─── 7. ROBUSTNESS: Final Express Error Handler ───────────────────────────────
 app.use((err: any, req: any, res: any, next: any) => {
-  console.error(`[Express] Unhandled error [${req.requestId || 'unknown'}]:`, err);
+  const isMulterLimit = err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE';
+  const status = isMulterLimit ? 413 : (Number(err?.status || err?.statusCode) || 500);
+  const code = isMulterLimit ? STANDARD_ERROR_CODES.BAD_REQUEST : (err?.code && typeof err.code === 'string' && status < 500 ? err.code : errorCode(status));
+  console.error(JSON.stringify({
+    event: 'unhandled_express_error',
+    requestId: req?.requestId || 'unknown',
+    userId: req?.userId ? String(req.userId) : null,
+    method: req?.method,
+    route: req?.originalUrl || req?.url,
+    status,
+    code,
+    message: err?.message || 'Unknown error',
+    stack: err?.stack ? String(err.stack).split('\n').slice(0, 8).join('\n') : undefined,
+  }));
   if (res.headersSent) {
     return next(err);
   }
-  const status = Number(err.status) || 500;
-  apiError(res, status, err.code || errorCode(status), err.message || 'Internal Server Error', req.requestId);
+  const clientMessage = status >= 500
+    ? 'Internal Server Error'
+    : (isMulterLimit ? 'Uploaded file exceeds maximum allowed size' : (err?.message || 'Bad Request'));
+  apiError(res, status, code, clientMessage, req?.requestId, status >= 500 || status === 429);
 });
 
 // ─── 7. ROBUSTNESS: Process Unhandled Listeners ────────────────────────────────
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[Process] Unhandled Rejection at:', promise, 'reason:', reason);
+process.on('unhandledRejection', (reason: any) => {
+  systemMetrics.unhandledRejections++;
+  console.error(JSON.stringify({
+    event: 'unhandled_rejection',
+    message: reason?.message || String(reason),
+    stack: reason?.stack ? String(reason.stack).split('\n').slice(0, 8).join('\n') : undefined,
+  }));
 });
 
-process.on('uncaughtException', (err) => {
-  console.error('[Process] Uncaught Exception:', err);
+process.on('uncaughtException', (err: any) => {
+  systemMetrics.uncaughtExceptions++;
+  console.error(JSON.stringify({
+    event: 'uncaught_exception',
+    message: err?.message || String(err),
+    stack: err?.stack ? String(err.stack).split('\n').slice(0, 8).join('\n') : undefined,
+  }));
 });
 
 // ─── 7. ROBUSTNESS: Graceful Shutdown on SIGTERM & SIGINT ─────────────────────
@@ -5049,25 +6523,50 @@ let server: any = null;
 const backgroundIntervals: NodeJS.Timeout[] = [];
 
 async function gracefulShutdown(signal: string) {
-  console.log(`[Process] Received ${signal}. Closing gracefully...`);
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(JSON.stringify({ event: 'shutdown_initiated', signal, workerId: WORKER_ID, timeoutMs: SHUTDOWN_TIMEOUT_MS }));
+
+  const forceTimer = setTimeout(() => {
+    console.error(JSON.stringify({ event: 'shutdown_forced_timeout', signal, workerId: WORKER_ID }));
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  forceTimer.unref?.();
+
   for (const interval of backgroundIntervals) clearInterval(interval);
   backgroundIntervals.length = 0;
+
   try { bot?.stop(signal); } catch { /* ignore */ }
+
   if (server) {
     await new Promise<void>((resolve) => {
       server.close((err: any) => {
         if (err) console.error('[Server] Error closing server:', err);
-        else console.log('[Server] Server closed.');
         resolve();
       });
     });
   }
+
+  // Safely release active job leases owned by this worker so another instance can resume them
+  if (db) {
+    try {
+      await db.collection('jobs').updateMany(
+        { status: 'running', leaseOwner: WORKER_ID },
+        { $set: { status: 'queued', stage: 'queued_after_shutdown', nextRunAt: new Date(), updatedAt: new Date() }, $unset: { leaseUntil: '', leaseOwner: '' } }
+      );
+    } catch { /* ignore */ }
+  }
+
+  if (tgClient) {
+    try { await tgClient.disconnect(); } catch { /* ignore */ }
+  }
+
   try {
     await client.close();
-    console.log('[Mongo] Connection closed.');
   } catch (err) {
     console.error('[Mongo] Error closing connection:', err);
   }
+  clearTimeout(forceTimer);
   process.exit(0);
 }
 
@@ -5087,6 +6586,12 @@ if (process.env.CLOUDYTE_TEST_MODE !== '1') {
   backgroundIntervals.push(setInterval(() => pruneTempFiles(), 3600000));
   backgroundIntervals.push(setInterval(() => sweepUploadSessions().catch(err => console.error('[UploadSessions] Sweep failed:', err)), 5 * 60 * 1000));
   backgroundIntervals.push(setInterval(() => sweepExpiredTrash().catch(err => console.error('[Trash] Sweep failed:', err)), 60 * 60 * 1000));
+  let lastLoopTick = Date.now();
+  backgroundIntervals.push(setInterval(() => {
+    const now = Date.now();
+    systemMetrics.eventLoopLagMs = Math.max(0, now - lastLoopTick - 1000);
+    lastLoopTick = now;
+  }, 1000));
   runJobWorker();
   backgroundIntervals.push(setInterval(() => runJobWorker(), 2000));
   server = app.listen(Number(PORT), '0.0.0.0', () => console.log(`Cloudyte running at http://localhost:${PORT}`));
@@ -5095,5 +6600,6 @@ if (process.env.CLOUDYTE_TEST_MODE !== '1') {
   server.keepAliveTimeout = 65_000;
 }
 
-export { sweepUploadSessions, sweepExpiredTrash, runJobWorker, pruneTempFiles, pruneThumbDir };
+export { sweepUploadSessions, sweepExpiredTrash, runJobWorker, pruneTempFiles, pruneThumbDir, TEMP_DIR };
 export default app;
+

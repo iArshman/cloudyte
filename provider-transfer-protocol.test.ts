@@ -25,6 +25,7 @@ const {
   sweepExpiredTrash,
   runJobWorker,
   runEncryptionMigration,
+  TEMP_DIR,
 } = await import('./server.ts');
 
 // ─── In-memory MongoDB Mock for Integration Tests ───────────────────────────
@@ -1630,4 +1631,342 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     assert.equal(finalEvent.status, 'completed');
     assert.equal(finalEvent.progressPct, 100);
   });
+
+  // ── 51. Upload Session Pause, Resume, and Dedicated TEMP_DIR Verification ──
+  await t.test('51. Supports pausing and resuming upload sessions and stages files in dedicated TEMP_DIR', async () => {
+    const payload = Buffer.from('Resumable pause-and-resume test payload');
+    const sha256 = crypto.createHash('sha256').update(payload).digest('hex');
+
+    const createRes = await apiFetch(`/api/upload-sessions/${tgAccount1Id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'pause-resume.txt',
+        mimeType: 'text/plain',
+        size: payload.length,
+        folderId: 'root',
+        checksum: sha256,
+        idempotencyKey: `idem_pause_resume_${Date.now()}`,
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const session: any = await createRes.json();
+    assert.equal(session.status, 'active');
+
+    // Verify stored tempPath is inside the dedicated TEMP_DIR
+    const rawSessionDoc = await mockDb.collection('upload_sessions').findOne({ sessionId: session.sessionId });
+    assert.ok(rawSessionDoc);
+    assert.equal(path.dirname(rawSessionDoc.tempPath), path.resolve(TEMP_DIR));
+
+    const sendChunk = async (sid: string, buf: Buffer) => {
+      const form = new FormData();
+      form.append('chunk', new Blob([buf]), 'chunk.bin');
+      return apiFetch(`/api/upload-sessions/${sid}/chunks`, {
+        method: 'PUT',
+        headers: { 'Content-Range': `bytes 0-${buf.length - 1}/${buf.length}` },
+        body: form,
+      });
+    };
+
+    // Pause session
+    const pauseRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/pause`, { method: 'POST' });
+    assert.equal(pauseRes.status, 200);
+    const pausedJson: any = await pauseRes.json();
+    assert.equal(pausedJson.status, 'paused');
+
+    // Uploading a chunk while paused fails with 409 UPLOAD_SESSION_NOT_ACTIVE
+    const chunkWhilePaused = await sendChunk(session.sessionId, payload);
+    assert.equal(chunkWhilePaused.status, 409);
+    const pausedErr: any = await chunkWhilePaused.json();
+    assert.equal(pausedErr.code, 'UPLOAD_SESSION_NOT_ACTIVE');
+
+    // Resume session
+    const resumeRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/resume`, { method: 'POST' });
+    assert.equal(resumeRes.status, 200);
+    const resumedJson: any = await resumeRes.json();
+    assert.equal(resumedJson.status, 'active');
+
+    // Upload chunk and complete
+    const chunkAfterResume = await sendChunk(session.sessionId, payload);
+    assert.equal(chunkAfterResume.status, 200);
+    const completeRes = await apiFetch(`/api/upload-sessions/${session.sessionId}/complete`, { method: 'POST' });
+    assert.equal(completeRes.status, 200);
+    const completeJson: any = await completeRes.json();
+    assert.equal(completeJson.success, true);
+  });
+
+  // ── 52. Transfer Manifest Verification, Job Listing, and Job Cancellation ──
+  await t.test('52. Records transfer manifests on cross-account transfer and supports job listing and cancellation', async () => {
+    const manifests = await mockDb.collection('transfer_manifests').find({}).toArray();
+    assert.ok(manifests.length >= 1);
+    const completedManifest = manifests.find((m: any) => m.status === 'completed');
+    assert.ok(completedManifest);
+    assert.equal(typeof completedManifest.checksum, 'string');
+
+    // List jobs for user
+    const listJobsRes = await apiFetch('/api/jobs');
+    assert.equal(listJobsRes.status, 200);
+    const jobsList: any[] = await listJobsRes.json();
+    assert.ok(jobsList.length >= 1);
+
+    // Enqueue a new async transfer job and cancel it before worker runs
+    const filesInTg = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id }).toArray();
+    const sampleFile = filesInTg[0];
+    assert.ok(sampleFile);
+
+    const asyncMoveRes = await apiFetch('/api/files/copy?async=true', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        fileId: String(sampleFile._id),
+        targetAccountId: String(gdAccount1Id),
+        targetFolderId: 'root',
+      }),
+    });
+    assert.equal(asyncMoveRes.status, 202);
+    const { jobId } = (await asyncMoveRes.json()) as any;
+
+    const cancelRes = await apiFetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    assert.equal(cancelRes.status, 200);
+    const cancelledJob: any = await cancelRes.json();
+    assert.equal(cancelledJob.status, 'cancelled');
+  });
+
+  // ── 53. Health, Readiness, and Admin Observability Metrics ──
+  await t.test('53. Exposes /healthz, /readyz, and admin-protected /api/admin/metrics observability snapshot', async () => {
+    const healthRes = await fetch(`${baseUrl}/healthz`);
+    assert.equal(healthRes.status, 200);
+    const healthJson: any = await healthRes.json();
+    assert.equal(healthJson.ok, true);
+
+    const readyRes = await fetch(`${baseUrl}/readyz`);
+    assert.equal(readyRes.status, 200);
+    const readyJson: any = await readyRes.json();
+    assert.equal(readyJson.status, 'ready');
+    assert.equal(readyJson.mongo, true);
+
+    // Non-admin user is denied access to /api/admin/metrics
+    const nonAdminMetrics = await apiFetch('/api/admin/metrics');
+    assert.equal(nonAdminMetrics.status, 403);
+
+    // Admin basic auth receives full observability metrics
+    const adminAuth = Buffer.from('admin:password').toString('base64');
+    const adminMetricsRes = await fetch(`${baseUrl}/api/admin/metrics`, {
+      headers: { Authorization: `Basic ${adminAuth}` },
+    });
+    assert.equal(adminMetricsRes.status, 200);
+    const metricsJson: any = await adminMetricsRes.json();
+    assert.equal(typeof metricsJson.uptimeSeconds, 'number');
+    assert.ok(metricsJson.memoryUsage);
+    assert.ok(metricsJson.disk);
+    assert.ok(metricsJson.jobs);
+    assert.ok(metricsJson.uploads);
+    assert.ok(metricsJson.cache);
+    assert.ok(Array.isArray(metricsJson.alerts));
+  });
+
+  // ── 54. Batch Backup Partial-Failure Resilience, Verification, and Conflict-Safe Restore ──
+  await t.test('54. Runs batch backups with partial-failure resilience, verifies manifests, and creates conflict copies on restore', async () => {
+    const fd = new FormData();
+    fd.append('file', new Blob([Buffer.from('batch-backup-payload')], { type: 'text/plain' }), 'backup-doc.txt');
+    const upRes = await apiFetch(`/api/upload/${tgAccount1Id}`, { method: 'POST', body: fd });
+    assert.equal(upRes.status, 200);
+
+    const tgFiles = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id, name: 'backup-doc.txt' }).toArray();
+    assert.equal(tgFiles.length, 1);
+    const validFileId = String(tgFiles[0]._id);
+
+    // Enqueue batch backup with 1 valid file and 1 missing file to test partial failure resilience
+    const batchRes = await apiFetch('/api/backups/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        targetAccountId: String(gdAccount1Id),
+        targetFolderId: 'root',
+        fileIds: [validFileId, '000000000000000000000999'],
+        conflictStrategy: 'rename',
+      }),
+    });
+    assert.equal(batchRes.status, 202);
+    const { jobId: batchJobId } = (await batchRes.json()) as any;
+
+    for (let i = 0; i < 30; i++) {
+      await runJobWorker();
+      const jobDoc = await mockDb.collection('jobs').findOne({ _id: batchJobId });
+      if (jobDoc?.status === 'completed' || jobDoc?.status === 'failed') break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const batchManifest = await mockDb.collection('transfer_manifests').findOne({ jobId: batchJobId });
+    assert.ok(batchManifest, 'Batch backup manifest should be recorded');
+    assert.equal(batchManifest.succeededCount, 1);
+    assert.equal(batchManifest.failedCount, 1);
+    assert.equal(batchManifest.status, 'completed_with_errors');
+
+    // Verify backup manifest via endpoint
+    const verifyRes = await apiFetch(`/api/backups/${batchJobId}/verify`, { method: 'POST' });
+    assert.equal(verifyRes.status, 200);
+    const verifyJson: any = await verifyRes.json();
+    assert.equal(verifyJson.verifiedCount, 1);
+    assert.equal(verifyJson.totalItems, 2);
+
+    // Also test a clean single-item batch backup between TG accounts and non-destructive restore with conflict copy
+    const tgAccount2Id = new ObjectId('65f000000000000000000099');
+    await mockDb.collection('accounts').insertOne({
+      _id: tgAccount2Id,
+      userId: 'user_1',
+      accountType: 'tgdrive',
+      channelId: '-1001234567890',
+      name: 'Secondary TG Drive',
+    });
+
+    const cleanBatchRes = await apiFetch('/api/backups/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(tgAccount1Id),
+        targetAccountId: String(tgAccount2Id),
+        targetFolderId: 'root',
+        fileIds: [validFileId],
+        conflictStrategy: 'rename',
+      }),
+    });
+    assert.equal(cleanBatchRes.status, 202);
+    const { jobId: cleanJobId } = (await cleanBatchRes.json()) as any;
+    for (let i = 0; i < 20; i++) {
+      await runJobWorker();
+      const jobDoc = await mockDb.collection('jobs').findOne({ _id: cleanJobId });
+      if (jobDoc?.status === 'completed') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const cleanVerifyRes = await apiFetch(`/api/backups/${cleanJobId}/verify`, { method: 'POST' });
+    const cleanVerifyJson: any = await cleanVerifyRes.json();
+    assert.equal(cleanVerifyJson.verified, true);
+
+    // Restore back to tgAccount1Id where 'backup-doc.txt' already exists -> should create 'backup-doc (conflict copy).txt'
+    const restoreRes = await apiFetch(`/api/backups/${cleanJobId}/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetAccountId: String(tgAccount1Id),
+        targetFolderId: 'root',
+      }),
+    });
+    assert.equal(restoreRes.status, 202);
+    const { jobId: restoreJobId } = (await restoreRes.json()) as any;
+    for (let i = 0; i < 20; i++) {
+      await runJobWorker();
+      const jobDoc = await mockDb.collection('jobs').findOne({ _id: restoreJobId });
+      if (jobDoc?.status === 'completed') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const restoredFiles = await mockDb.collection('tg_files').find({ accountId: tgAccount1Id }).toArray();
+    const conflictCopy = restoredFiles.find((f: any) => f.name === 'backup-doc (conflict copy).txt');
+    assert.ok(conflictCopy, 'Restore must create a conflict copy rather than overwriting existing file silently');
+  });
+
+  await t.test('55. Zero-double-write raw stream chunk uploads, OneDrive trash lifecycle, and sliding session expiry', async () => {
+    // 1. Raw binary stream chunk upload (application/octet-stream) without intermediate multer disk write
+    const rawPayload = Buffer.from('Zero-double-write direct stream upload payload for Cloudyte!');
+    const rawSha256 = crypto.createHash('sha256').update(rawPayload).digest('hex');
+
+    const initRes = await apiFetch(`/api/upload-sessions/${String(tgAccount1Id)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'raw-stream-test.txt',
+        mimeType: 'text/plain',
+        totalBytes: rawPayload.length,
+        chunkSize: 32,
+        folderId: 'root',
+        checksum: rawSha256,
+        idempotencyKey: `idem_raw_stream_${Date.now()}`,
+      }),
+    });
+    assert.equal(initRes.status, 201);
+    const { sessionId } = (await initRes.json()) as any;
+
+    const part1 = rawPayload.subarray(0, 32);
+    const part2 = rawPayload.subarray(32);
+
+    const c1Res = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(part1.length),
+        'X-Chunk-Offset': '0',
+      },
+      body: part1,
+    });
+    assert.equal(c1Res.status, 200);
+    const c1Json: any = await c1Res.json();
+    assert.equal(c1Json.receivedBytes, part1.length);
+
+    // Exact replay of chunk 1 via raw stream should be idempotently accepted
+    const replayRes = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(part1.length),
+        'X-Chunk-Offset': '0',
+      },
+      body: part1,
+    });
+    assert.equal(replayRes.status, 200);
+
+    const c2Res = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(part2.length),
+        'X-Chunk-Offset': String(part1.length),
+      },
+      body: part2,
+    });
+    assert.equal(c2Res.status, 200);
+    const c2Json: any = await c2Res.json();
+    assert.equal(c2Json.complete, true);
+
+    const completeRes = await apiFetch(`/api/upload-sessions/${sessionId}/complete`, { method: 'POST' });
+    assert.equal(completeRes.status, 200);
+
+    // 2. OneDrive Trash lifecycle: soft-delete -> list trash -> restore -> soft-delete -> empty trash
+    const odTrashFileId = 'od_trash_item_99';
+    const delOdRes = await apiFetch(`/api/files/${odTrashFileId}?accountId=${String(odAccount1Id)}`, {
+      method: 'DELETE',
+    });
+    assert.equal(delOdRes.status, 200);
+    const delOdJson: any = await delOdRes.json();
+    assert.equal(delOdJson.trashed, true);
+
+    const listOdTrashRes = await apiFetch(`/api/trash?accountId=${String(odAccount1Id)}`);
+    assert.equal(listOdTrashRes.status, 200);
+    const odTrashItems: any[] = await listOdTrashRes.json();
+    assert.ok(odTrashItems.some((it: any) => String(it.id) === odTrashFileId), 'OneDrive trashed item must be listed in /api/trash');
+
+    const restoreOdRes = await apiFetch('/api/trash/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: String(odAccount1Id), fileId: odTrashFileId }),
+    });
+    assert.equal(restoreOdRes.status, 200);
+
+    const listAfterRestore = await apiFetch(`/api/trash?accountId=${String(odAccount1Id)}`);
+    const afterRestoreItems: any[] = await listAfterRestore.json();
+    assert.ok(!afterRestoreItems.some((it: any) => String(it.id) === odTrashFileId), 'Restored OneDrive item should leave trash');
+
+    // Soft-delete again and Empty Trash
+    await apiFetch(`/api/files/${odTrashFileId}?accountId=${String(odAccount1Id)}`, { method: 'DELETE' });
+    const emptyOdTrashRes = await apiFetch(`/api/trash?accountId=${String(odAccount1Id)}`, { method: 'DELETE' });
+    assert.equal(emptyOdTrashRes.status, 200);
+    const emptyOdJson: any = await emptyOdTrashRes.json();
+    assert.ok(emptyOdJson.deletedCount >= 1);
+  });
 });
+
+
+
