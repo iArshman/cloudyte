@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import axios from 'axios';
 import path from 'path';
 import stream from 'stream';
@@ -7,7 +8,6 @@ import { Telegraf } from 'telegraf';
 import { ObjectId } from 'mongodb';
 import { Api } from 'telegram/tl/index.js';
 import type { TelegramClient } from 'telegram';
-import { LargeFileUploadTask } from '@microsoft/microsoft-graph-client';
 
 const SALT_ROUNDS = 10;
 
@@ -21,10 +21,11 @@ export interface BotDeps {
   resolvePeer: (telegram: TelegramClient, id: string) => Promise<any>;
   driveCache: { get: (k: string) => any; set: (k: string, v: any, ttl?: number) => any };
   invalidateDriveCache: (accountId: string) => void;
-  deleteThumbFiles?: (fileId: string) => void;
+  deleteThumbFiles?: (fileId: string, accountId?: string) => void;
   nanoid: (length?: number) => string;
   nanoid12: () => string;
   oauth2Client: any;
+  createOAuthState: (database: any, userId: string, provider: 'google' | 'microsoft') => Promise<string>;
   MICROSOFT_CLIENT_ID?: string;
   MICROSOFT_REDIRECT_URI: string;
 }
@@ -43,7 +44,7 @@ export function initBot(deps: BotDeps): Telegraf | null {
   const {
     connectToMongo, getUserIdByTg, getDriveClient, getOneDriveClient,
     getTgClient, resolvePeer, driveCache, invalidateDriveCache, deleteThumbFiles,
-    nanoid, nanoid12, oauth2Client, MICROSOFT_CLIENT_ID, MICROSOFT_REDIRECT_URI,
+    nanoid, nanoid12, oauth2Client, createOAuthState, MICROSOFT_CLIENT_ID, MICROSOFT_REDIRECT_URI,
   } = deps;
 
   const bot = new Telegraf(botToken);
@@ -85,12 +86,13 @@ async function renderBrowser(ctx: any, accId: string, folderId: string, pageToke
       if (!channelId) return ctx.reply('❌ No channel configured for this TG Drive account.');
 
       const currentFolder = folderId === 'root' ? '' : folderId;
+      const escapedFolder = currentFolder ? currentFolder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/' : '';
       const [rawFiles, rawFolders] = await Promise.all([
         database.collection('tg_files')
           .find({ accountId: new ObjectId(accId), folder: currentFolder })
           .sort({ date: -1 }).limit(20).toArray(),
         database.collection('tg_folders')
-          .find({ accountId: new ObjectId(accId), path: { $regex: `^${currentFolder ? currentFolder + '/' : ''}[^/]+$` } })
+          .find({ accountId: new ObjectId(accId), path: { $regex: `^${escapedFolder}[^/]+$` } })
           .toArray()
       ]);
 
@@ -134,7 +136,8 @@ async function renderBrowser(ctx: any, accId: string, folderId: string, pageToke
         parentId = cached.parentId;
       } else {
         const drive = await getDriveClient(account.tokens);
-        const q = `'${folderId}' in parents and trashed = false`;
+        const safeFolderId = String(folderId || 'root').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const q = `'${safeFolderId}' in parents and trashed = false`;
         const [metaRes, listRes] = await Promise.all([
           folderId === 'root' ? Promise.resolve({ data: { name: 'Google Drive Root', parents: [] } }) : drive.files.get({ fileId: folderId, fields: 'name,parents' }),
           drive.files.list({ pageSize: 12, pageToken, q, fields: 'files(id,name,mimeType),nextPageToken', orderBy: 'folder,name' })
@@ -260,7 +263,7 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
   const botAuth = async (ctx: any, next: () => Promise<void>) => {
     const database = await connectToMongo();
     const user = await database.collection('users').findOne({ tgIds: String(ctx.from.id) });
-    if (!user) {
+    if (!user || user.isActive === false) {
       return ctx.reply('❌ *Authentication Required*\n\nYou must be logged in to use this command.\n\n🔐 Use `/login <user> <pass>`\n🚀 Use `/register <user> <pass>` (if allowed)', { parse_mode: 'Markdown' });
     }
     ctx.state.user = user;
@@ -317,9 +320,14 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
   bot.command('settings', botAuth, async (ctx) => renderSettings(ctx));
 
   bot.command('register', async (ctx) => {
-    const parts = (ctx.message as any).text.split(' ');
+    const parts = (ctx.message as any).text.trim().split(/\s+/);
+    await ctx.deleteMessage().catch(() => {});
     if (parts.length < 3) return ctx.reply('🚀 *Cloudyte Registration*\n\nUsage: `/register <username> <password>`', { parse_mode: 'Markdown' });
-    const [, username, password] = parts;
+    const username = parts[1].trim();
+    const password = parts[2];
+    if (!username || username.length < 2 || username.length > 64 || !password || password.length < 4 || password.length > 256) {
+      return ctx.reply('❌ Invalid username or password (min 4 chars for password).');
+    }
     const database = await connectToMongo();
     
     const globalReg = await database.collection('settings').findOne({ key: 'registrationEnabled' });
@@ -350,18 +358,20 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
   });
 
   bot.command('login', async (ctx) => {
-    const parts    = (ctx.message as any).text.split(' ');
+    const parts    = (ctx.message as any).text.trim().split(/\s+/);
     const database = await connectToMongo();
     
     if (parts.length < 3) {
       const user = await database.collection('users').findOne({ tgIds: String(ctx.from.id) });
-      if (user) return ctx.reply(`🔓 Authenticated as *${user.username}*!\n\nDashboard: ${process.env.APP_URL}`, { parse_mode: 'Markdown' });
+      if (user && user.isActive !== false) return ctx.reply(`🔓 Authenticated as *${user.username}*!\n\nDashboard: ${process.env.APP_URL}`, { parse_mode: 'Markdown' });
       return ctx.reply('🔐 *Cloudyte Login*\n\nUsage: `/login <username> <password>`', { parse_mode: 'Markdown' });
     }
-    
-    const [, username, password] = parts;
+
+    await ctx.deleteMessage().catch(() => {});
+    const username = parts[1].trim();
+    const password = parts[2];
     const user = await database.collection('users').findOne({ username });
-    if (!user || !user.isActive) return ctx.reply('❌ Invalid credentials or account disabled');
+    if (!user || user.isActive === false) return ctx.reply('❌ Invalid credentials or account disabled');
     
     const match = await bcrypt.compare(password, user.password);
     if (!match) return ctx.reply('❌ Invalid credentials');
@@ -402,11 +412,12 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     if (!userId) return ctx.answerCbQuery('❌ Login first').then(() => ctx.reply('Use /login or /register'));
     
     await ctx.answerCbQuery().catch(() => {});
+    const state = await createOAuthState(database, String(userId), 'google');
     const url = oauth2Client.generateAuthUrl({ 
       access_type: 'offline', 
       scope: ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile'], 
       prompt: 'consent', 
-      state: JSON.stringify({ userId }) 
+      state
     });
     ctx.reply('Link your Google Drive:', { reply_markup: { inline_keyboard: [[{ text: '🔗 Link Google Drive', url }]] } });
   });
@@ -417,11 +428,15 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     if (!userId) return ctx.answerCbQuery('❌ Login first').then(() => ctx.reply('Use /login or /register'));
 
     await ctx.answerCbQuery().catch(() => {});
-    const url = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=${MICROSOFT_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(MICROSOFT_REDIRECT_URI)}&response_mode=query&scope=${encodeURIComponent('files.readwrite.all User.Read offline_access')}&state=${encodeURIComponent(JSON.stringify({ userId }))}&prompt=select_account`;
+    const state = await createOAuthState(database, String(userId), 'microsoft');
+    const url = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=${MICROSOFT_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(MICROSOFT_REDIRECT_URI)}&response_mode=query&scope=${encodeURIComponent('files.readwrite.all User.Read offline_access')}&state=${encodeURIComponent(state)}&prompt=select_account`;
     ctx.reply('Link your OneDrive:', { reply_markup: { inline_keyboard: [[{ text: '🔗 Link OneDrive', url }]] } });
   });
 
   bot.action('link_tgdrive', async (ctx) => {
+    const database = await connectToMongo();
+    const userId = await getUserIdByTg(ctx.from!.id, database);
+    if (!userId) return ctx.answerCbQuery('❌ Login first');
     await ctx.answerCbQuery().catch(() => {});
     botState[ctx.from!.id] = { action: 'register_tgdrive_channel', data: {} };
     ctx.reply(`📡 *Register TG Drive Channel*\n\nStep 1/2: Send the channel ID or username\n(e.g. \`-1001234567890\` or \`@mychannel\`)\n\n⚠️ Make sure the bot is an **admin** in the channel.`, { parse_mode: 'Markdown' });
@@ -445,11 +460,12 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         buttons = files.map((f: any) => [{ text: `📄 ${f.name}`, callback_data: getCb('info', defaultAcc._id.toString(), String(f._id)) }]);
       } else if (defaultAcc.accountType === 'onedrive') {
         const c   = await getOneDriveClient(defaultAcc.tokens, defaultAcc._id.toString());
-        const r   = await c.api(`/me/drive/root/search(q='${queryStr.replace(/'/g, "''")}')`).top(8).get();
+        const r   = await c.api(`/me/drive/root/search(q='${queryStr.replace(/[\r\n\0]/g, '').replace(/'/g, "''")}')`).top(8).get();
         buttons   = (r.value || []).map((f: any) => [{ text: `📄 ${f.name}`, callback_data: getCb('info', defaultAcc._id.toString(), f.id) }]);
       } else {
         const drive = await getDriveClient(defaultAcc.tokens);
-        const r     = await drive.files.list({ q: `name contains '${queryStr.replace(/'/g, "\\'")}' and trashed = false`, fields: 'files(id,name)', pageSize: 8 });
+        const safeQ = queryStr.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const r     = await drive.files.list({ q: `name contains '${safeQ}' and trashed = false`, fields: 'files(id,name)', pageSize: 8 });
         buttons     = (r.data.files || []).map(f => [{ text: `📄 ${f.name}`, callback_data: getCb('info', defaultAcc._id.toString(), f.id!) }]);
       }
       if (!buttons.length) return ctx.reply('🔍 No files found.');
@@ -565,36 +581,74 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         return;
       }
 
-      const account = data.accId ? await database.collection('accounts').findOne({ _id: new ObjectId(data.accId) }) : null;
+      const userId = await getUserIdByTg(ctx.from!.id, database);
+      if (!userId) {
+        delete botState[ctx.from.id];
+        return ctx.reply('❌ Session expired or account inactive. Use /login.');
+      }
+
+      const account = data.accId && ObjectId.isValid(data.accId)
+        ? await database.collection('accounts').findOne({ _id: new ObjectId(data.accId) })
+        : null;
+      if (data.accId && (!account || String(account.userId) !== String(userId))) {
+        delete botState[ctx.from.id];
+        return ctx.reply('⛔ Access denied to this account.');
+      }
+
+      const isSafeBotFilename = (v: string) =>
+        Boolean(v) && v.length <= 255 && !v.includes('/') && !v.includes('\\') && v !== '.' && v !== '..' && !v.includes('..') && !/[\x00-\x1f\x7f]/.test(v);
 
       if (action === 'rename_prompt' && account) {
+        const newName = ctx.message.text.trim();
+        if (!isSafeBotFilename(newName)) {
+          delete botState[ctx.from.id];
+          return ctx.reply('❌ Invalid filename.');
+        }
         if (account.accountType === 'tgdrive') {
-          await database.collection('tg_files').updateOne({ _id: new ObjectId(data.fileId) }, { $set: { name: ctx.message.text } });
+          if (!ObjectId.isValid(data.fileId)) {
+            delete botState[ctx.from.id];
+            return ctx.reply('❌ Invalid file ID.');
+          }
+          const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(data.fileId), accountId: account._id });
+          if (!meta) {
+            delete botState[ctx.from.id];
+            return ctx.reply('❌ File not found.');
+          }
+          if (meta.isEncrypted === true) {
+            delete botState[ctx.from.id];
+            return ctx.reply('🔒 Encrypted files cannot be renamed from the bot.');
+          }
+          await database.collection('tg_files').updateOne({ _id: meta._id }, { $set: { name: newName, updatedAt: new Date() } });
         } else if (account.accountType === 'onedrive') {
-          const c = await getOneDriveClient(account.tokens);
-          await c.api(`/me/drive/items/${data.fileId}`).patch({ name: ctx.message.text });
+          const c = await getOneDriveClient(account.tokens, data.accId);
+          await c.api(`/me/drive/items/${data.fileId}`).patch({ name: newName });
         } else {
           const drive = await getDriveClient(account.tokens);
-          await drive.files.update({ fileId: data.fileId, requestBody: { name: ctx.message.text } });
+          await drive.files.update({ fileId: data.fileId, requestBody: { name: newName } });
         }
         invalidateDriveCache(data.accId);
-        ctx.reply(`✅ Renamed to: \`${ctx.message.text}\``, { parse_mode: 'Markdown' });
+        ctx.reply(`✅ Renamed to: \`${newName}\``, { parse_mode: 'Markdown' });
       } else if (action === 'mkdir_prompt' && account) {
+        const folderName = ctx.message.text.trim();
+        if (!isSafeBotFilename(folderName)) {
+          delete botState[ctx.from.id];
+          return ctx.reply('❌ Invalid folder name.');
+        }
         if (account.accountType === 'tgdrive') {
           const parentPath = (!data.folderId || data.folderId === 'root') ? '' : data.folderId;
-          const folderPath = parentPath ? `${parentPath}/${ctx.message.text}` : ctx.message.text;
+          const folderPath = parentPath ? `${parentPath}/${folderName}` : folderName;
           await database.collection('tg_folders').updateOne(
             { accountId: account._id, path: folderPath },
-            { $set: { accountId: account._id, name: ctx.message.text, path: folderPath, createdAt: Math.floor(Date.now() / 1000) } },
+            { $set: { accountId: account._id, userId: String(userId), name: folderName, path: folderPath, createdAt: Math.floor(Date.now() / 1000) } },
             { upsert: true }
           );
         } else if (account.accountType === 'onedrive') {
-          const c = await getOneDriveClient(account.tokens);
+          const c = await getOneDriveClient(account.tokens, data.accId);
           const parentPath = (!data.folderId || data.folderId === 'root') ? '/me/drive/root' : `/me/drive/items/${data.folderId}`;
-          await c.api(`${parentPath}/children`).post({ name: ctx.message.text, folder: {}, '@microsoft.graph.conflictBehavior': 'rename' });
+          await c.api(`${parentPath}/children`).post({ name: folderName, folder: {}, '@microsoft.graph.conflictBehavior': 'rename' });
         } else {
           const drive = await getDriveClient(account.tokens);
-          await drive.files.create({ requestBody: { name: ctx.message.text, parents: [data.folderId || 'root'], mimeType: 'application/vnd.google-apps.folder' } });
+          await drive.files.create({ requestBody: { name: folderName, parents: [data.folderId || 'root'], mimeType: 'application/vnd.google-apps.folder' } });
         }
         invalidateDriveCache(data.accId);
         delete botState[ctx.from.id];
@@ -616,7 +670,8 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     let folderId = '';
 
     const userId = await getUserIdByTg(ctx.from!.id, database);
-    const userDoc = userId ? await database.collection('users').findOne({ _id: userId }) : null;
+    if (!userId) return ctx.reply('❌ Authentication required. Use /login first.');
+    const userDoc = await database.collection('users').findOne({ _id: userId });
 
     if (state?.action === 'upload_file' || state?.action === 'batch_upload') {
       accId    = state.data.accId;
@@ -625,9 +680,9 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     }
 
     let account: any;
-    if (accId) {
-      account = await database.collection('accounts').findOne({ _id: new ObjectId(accId) });
-    } else if (userId) {
+    if (accId && ObjectId.isValid(accId)) {
+      account = await database.collection('accounts').findOne({ _id: new ObjectId(accId), userId });
+    } else {
       const accounts = await database.collection('accounts').find({ userId }).toArray();
       account = accounts.find((a: any) => a.isDefault) || accounts[0];
       if (account) accId = account._id.toString();
@@ -639,7 +694,8 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
     const tgFile    = msg.document || msg.video || msg.audio || msg.voice || msg.video_note || (msg.photo && msg.photo[msg.photo.length - 1]);
     if (!tgFile) return;
 
-    const fileName = msg.document?.file_name || msg.audio?.file_name || msg.video?.file_name || `telegram_file_${Date.now()}`;
+    const rawFileName = msg.document?.file_name || msg.audio?.file_name || msg.video?.file_name || `telegram_file_${Date.now()}`;
+    const fileName = path.basename(rawFileName);
     const mimeType = tgFile.mime_type || 'application/octet-stream';
     const fileSize = tgFile.file_size || 0;
     const sizeMB   = (fileSize / (1024 ** 2)).toFixed(2);
@@ -648,27 +704,29 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
       // ── TG Drive: use copyMessage (zero bandwidth, instant, server-side) ──
       if (account.accountType === 'tgdrive') {
         await bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `📡 *Syncing to TG Drive...*\n\n📄 \`${fileName}\`\n💾 ${sizeMB} MB`, { parse_mode: 'Markdown' }).catch(() => {});
-      const caption = folderId ? `F[${folderId}] | ${fileName}` : fileName;
-      const copied  = await bot!.telegram.copyMessage(account.channelId, ctx.chat.id, ctx.message.message_id, { caption });
-      const shareId = nanoid12();
-      await database.collection('tg_files').insertOne({
-        accountId: account._id,
-        messageId: copied.message_id,
-        shareId,
-        name:      fileName,
-        size:      fileSize,
-        mimeType,
-        folder:    folderId || '',
-        caption,
-        date:      Math.floor(Date.now() / 1000),
-      });
-        invalidateDriveCache(accId);
+        const caption = folderId ? `F[${folderId}] | ${fileName}` : fileName;
+        const copied  = await bot!.telegram.copyMessage(account.channelId, ctx.chat.id, ctx.message.message_id, { caption });
+        const shareId = nanoid12();
+        await database.collection('tg_files').insertOne({
+          accountId: account._id,
+          userId:    String(userId),
+          messageId: copied.message_id,
+          shareId,
+          name:      fileName,
+          size:      fileSize,
+          mimeType,
+          folder:    folderId || '',
+          caption,
+          isEncrypted: false,
+          date:      Math.floor(Date.now() / 1000),
+        });
+        invalidateDriveCache(accId!);
         await bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `✅ *Saved to TG Drive!*\n\n📄 \`${fileName}\`\n📏 \`${sizeMB} MB\`\n📁 \`${folderId || 'Root'}\``, { parse_mode: 'Markdown' }).catch(() => {});
         return;
       }
 
       // ── Google Drive / OneDrive: download then re-upload ──────────────────
-      const tmpPath = path.join('/tmp', `tgu_${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
+      const tmpPath = path.join(os.tmpdir(), `tgu_${Date.now()}_${nanoid(6)}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
       try {
         // ── DOWNLOAD PHASE with progress ──────────────────────────────────
         await bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
@@ -678,17 +736,22 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
 
         if (fileSize <= 20 * 1024 * 1024) {
           const fileLink = await bot!.telegram.getFileLink(tgFile.file_id);
-          const resp     = await axios({ method: 'get', url: fileLink.href, responseType: 'arraybuffer',
-            onDownloadProgress: (evt: any) => {
-              const dl = evt.loaded || 0;
-              const now = Date.now();
+          const resp     = await axios({ method: 'get', url: fileLink.href, responseType: 'stream', timeout: 60_000 });
+          const ws       = fs.createWriteStream(tmpPath);
+          let dlBytes    = 0;
+          let lastDlUpd  = 0;
+          resp.data.on('data', (chunk: Buffer) => {
+            dlBytes += chunk.length;
+            const now = Date.now();
+            if (now - lastDlUpd > 2000) {
+              lastDlUpd = now;
               bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
-                `📥 *Downloading from Telegram...*\n\n📄 \`${fileName}\`\n\n${renderProgressBar(dl, fileSize)}\n_${(dl / (1024 ** 2)).toFixed(2)} MB / ${sizeMB} MB_`,
+                `📥 *Downloading from Telegram...*\n\n📄 \`${fileName}\`\n\n${renderProgressBar(dlBytes, fileSize || 1)}\n_${(dlBytes / (1024 ** 2)).toFixed(2)} MB / ${sizeMB} MB_`,
                 { parse_mode: 'Markdown' }
               ).catch(() => {});
             }
           });
-          fs.writeFileSync(tmpPath, Buffer.from(resp.data));
+          await stream.promises.pipeline(resp.data, ws);
         } else {
           const tgc  = await getTgClient();
           const peer = await resolvePeer(tgc, String(ctx.chat.id));
@@ -696,17 +759,32 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
           if (!msgs || !msgs[0]?.media) throw new Error('Could not retrieve file via MTProto');
           const ws      = fs.createWriteStream(tmpPath);
           let dlBytes   = 0, lastUpd = 0;
-          for await (const chunk of tgc.iterDownload({ file: msgs[0].media as any, requestSize: 1024 * 1024 })) {
-            ws.write(chunk); dlBytes += chunk.length;
-            if (Date.now() - lastUpd > 2000) {
-              bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
-                `📥 *Downloading via MTProto...*\n\n📄 \`${fileName}\`\n\n${renderProgressBar(dlBytes, fileSize)}\n_${(dlBytes / (1024 ** 2)).toFixed(2)} MB / ${sizeMB} MB_`,
-                { parse_mode: 'Markdown' }
-              ).catch(() => {});
-              lastUpd = Date.now();
+          try {
+            for await (const chunk of tgc.iterDownload({ file: msgs[0].media as any, requestSize: 1024 * 1024 })) {
+              if (!ws.write(chunk)) {
+                await new Promise<void>((resolve, reject) => {
+                  const onDrain = () => { cleanup(); resolve(); };
+                  const onErr = (err: any) => { cleanup(); reject(err); };
+                  const cleanup = () => { ws.off('drain', onDrain); ws.off('error', onErr); };
+                  ws.once('drain', onDrain);
+                  ws.once('error', onErr);
+                });
+              }
+              dlBytes += chunk.length;
+              if (Date.now() - lastUpd > 2000) {
+                bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
+                  `📥 *Downloading via MTProto...*\n\n📄 \`${fileName}\`\n\n${renderProgressBar(dlBytes, fileSize || 1)}\n_${(dlBytes / (1024 ** 2)).toFixed(2)} MB / ${sizeMB} MB_`,
+                  { parse_mode: 'Markdown' }
+                ).catch(() => {});
+                lastUpd = Date.now();
+              }
             }
+            ws.end();
+            await new Promise<void>((resolve, reject) => { ws.on('finish', resolve); ws.on('error', reject); });
+          } catch (dlErr) {
+            ws.destroy();
+            throw dlErr;
           }
-          await new Promise<void>((resolve, reject) => { ws.end(); ws.on('finish', resolve); ws.on('error', reject); });
         }
 
         // ── UPLOAD PHASE with progress ────────────────────────────────────
@@ -770,9 +848,9 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
           });
         }
 
-      if (userDoc?.backupEnabled && userDoc?.backupAccId) {
+      if (userDoc?.backupEnabled && userDoc?.backupAccId && ObjectId.isValid(userDoc.backupAccId)) {
         try {
-          const backupAcc = await database.collection('accounts').findOne({ _id: new ObjectId(userDoc.backupAccId) });
+          const backupAcc = await database.collection('accounts').findOne({ _id: new ObjectId(userDoc.backupAccId), userId });
           if (backupAcc) {
             await bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
               `🛡️ *Mirroring to Backup Drive...*\n\n📧 \`${backupAcc.email || backupAcc.channelId}\``,
@@ -784,9 +862,9 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
               const copied  = await bot!.telegram.copyMessage(backupAcc.channelId, ctx.chat.id, ctx.message.message_id, { caption });
               const shareId = nanoid12();
               await database.collection('tg_files').insertOne({
-                accountId: backupAcc._id, messageId: copied.message_id, shareId,
+                accountId: backupAcc._id, userId: String(userId), messageId: copied.message_id, shareId,
                 name: fileName, size: fileSize, mimeType,
-                folder: folderId || '', caption, date: Math.floor(Date.now() / 1000),
+                folder: folderId || '', caption, isEncrypted: false, date: Math.floor(Date.now() / 1000),
               });
             } else if (backupAcc.accountType === 'onedrive') {
               const c2 = await getOneDriveClient(backupAcc.tokens, backupAcc._id.toString());
@@ -845,81 +923,95 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
 
     const { action, accId, id } = stored;
     const database = await connectToMongo();
-    if (!['download', 'send_to_tg'].includes(action)) ctx.answerCbQuery().catch(() => {});
+    const userId   = await getUserIdByTg(ctx.from!.id, database);
+    if (!userId) return ctx.answerCbQuery('❌ Login required. Use /login.');
+
+    if (!['download', 'send_to_tg', 'mk_def', 'rm_def', 'rm_acc', 'toggle_backup', 'set_backup', 'toggle_reg'].includes(action)) {
+      ctx.answerCbQuery().catch(() => {});
+    }
 
     try {
       const isValidId = accId && accId !== 'null' && accId.length === 24 && /^[0-9a-fA-F]{24}$/.test(accId);
       const account   = isValidId ? await database.collection('accounts').findOne({ _id: new ObjectId(accId) }) : null;
+      if (account && String(account.userId) !== String(userId)) {
+        return ctx.answerCbQuery('⛔ Access denied');
+      }
 
       if (action === 'browse') {
+        if (!account) return ctx.answerCbQuery('❌ Account not found');
         if (botState[ctx.from.id]?.action === 'batch_upload') delete botState[ctx.from.id];
         await renderBrowser(ctx, accId, id, stored.pageToken, true);
 
       } else if (action === 'batch_mode') {
+        if (!account) return ctx.answerCbQuery('❌ Account not found');
         botState[ctx.from.id] = { action: 'batch_upload', data: { accId, folderId: id } };
         ctx.reply(`📦 *Batch Upload*\n\nEvery file you send now uploads here. Click Done when finished.`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '✅ Done', callback_data: getCb('browse', accId, id) }]] } });
-        ctx.answerCbQuery();
 
       } else if (action === 'mkdir') {
+        if (!account) return ctx.answerCbQuery('❌ Account not found');
         botState[ctx.from.id] = { action: 'mkdir_prompt', data: { accId, folderId: id } };
         ctx.reply(`📁 *New Folder*\n\nSend me the folder name:`, { parse_mode: 'Markdown' });
-        ctx.answerCbQuery();
 
       } else if (action === 'upload_prompt') {
+        if (!account) return ctx.answerCbQuery('❌ Account not found');
         botState[ctx.from.id] = { action: 'upload_file', data: { accId, folderId: id } };
         ctx.reply(`📤 *Upload File*\n\nSend the file to upload:`, { parse_mode: 'Markdown' });
-        ctx.answerCbQuery();
 
       } else if (action === 'files_list') {
-        const userId = await getUserIdByTg(ctx.from!.id, database);
         const accounts = await database.collection('accounts').find({ userId }).toArray();
         const buttons  = accounts.map((acc: any) => ([{ text: acc.accountType === 'tgdrive' ? `📡 TG Drive (${acc.channelId})` : `📧 ${acc.email}`, callback_data: getCb('browse', acc._id.toString(), 'root') }]));
         ctx.editMessageText('📂 *Select account:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 
       } else if (action === 'info') {
         if (!account) throw new Error('Account not found');
-        let name = 'Unknown', size = 'N/A', mimeType = 'file', shareId = '';
+        let name = 'Unknown', size = 'N/A', mimeType = 'file', shareId = '', isEncrypted = false;
 
         try {
           if (account.accountType === 'tgdrive') {
-            const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(id) });
+            if (!ObjectId.isValid(id)) throw new Error('Invalid file ID');
+            const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(id), accountId: account._id });
             if (!meta) throw new Error('File not found');
+            isEncrypted = meta.isEncrypted === true;
             name = meta.name || 'Unknown';
             size = meta.size ? (Number(meta.size) / (1024 ** 2)).toFixed(2) + ' MB' : 'N/A';
-            mimeType = meta.mimeType || 'file';
-            shareId = meta.shareId || '';
-          } else if (account.accountType === 'onedrive') {
-            const c = await getOneDriveClient(account.tokens, accId);
-            const f = await c.api(`/me/drive/items/${id}`).get();
-            name = f.name;
-            size = f.size ? (Number(f.size) / (1024 ** 2)).toFixed(2) + ' MB' : 'N/A';
-            mimeType = f.file?.mimeType || 'file';
+            mimeType = isEncrypted ? 'application/octet-stream' : (meta.mimeType || 'file');
+            shareId = isEncrypted ? '' : (meta.shareId || '');
           } else {
-            const drive = await getDriveClient(account.tokens);
-            const f = await drive.files.get({ fileId: id, fields: 'name,size,mimeType' });
-            name = f.data.name!;
-            size = f.data.size ? (Number(f.data.size) / (1024 ** 2)).toFixed(2) + ' MB' : 'N/A';
-            mimeType = f.data.mimeType!;
+            const meta = await database.collection('tg_files').findOne({ accountId: account._id, providerFileId: String(id) });
+            isEncrypted = meta?.isEncrypted === true;
+            if (account.accountType === 'onedrive') {
+              const c = await getOneDriveClient(account.tokens, accId);
+              const f = await c.api(`/me/drive/items/${id}`).get();
+              name = f.name;
+              size = f.size ? (Number(f.size) / (1024 ** 2)).toFixed(2) + ' MB' : 'N/A';
+              mimeType = isEncrypted ? 'application/octet-stream' : (f.file?.mimeType || 'file');
+            } else {
+              const drive = await getDriveClient(account.tokens);
+              const f = await drive.files.get({ fileId: id, fields: 'name,size,mimeType' });
+              name = f.data.name!;
+              size = f.data.size ? (Number(f.data.size) / (1024 ** 2)).toFixed(2) + ' MB' : 'N/A';
+              mimeType = isEncrypted ? 'application/octet-stream' : f.data.mimeType!;
+            }
           }
         } catch (e: any) {
-           console.error('Info fetch error:', e);
-           return ctx.answerCbQuery('❌ Error: ' + e.message);
+          console.error('Info fetch error:', e);
+          return ctx.answerCbQuery('❌ Error: ' + e.message);
         }
 
         const shareLink = shareId ? `${process.env.APP_URL}/s/${shareId}` : null;
-        const buttons: any[][] = [
-          [{ text: '📱 Send to Telegram', callback_data: getCb('send_to_tg', accId, id) }],
-          [{ text: '✏️ Rename', callback_data: getCb('rename', accId, id) }],
-          [{ text: '🗑️ Delete', callback_data: getCb('delete', accId, id) }],
-        ];
+        const buttons: any[][] = [];
+        if (!isEncrypted) {
+          buttons.push([{ text: '📱 Send to Telegram', callback_data: getCb('send_to_tg', accId, id) }]);
+          buttons.push([{ text: '✏️ Rename', callback_data: getCb('rename', accId, id) }]);
+        }
+        buttons.push([{ text: '🗑️ Delete', callback_data: getCb('delete', accId, id) }]);
         if (shareLink) buttons.unshift([{ text: '🔗 Share Link', url: shareLink }]);
         buttons.push([{ text: '⬅️ Back', callback_data: getCb('browse', accId, 'root') }]);
 
-        // Safety: escape underscores for simple markdown
         const safeName = name.replace(/_/g, '\\_').replace(/\*/g, '\\*');
         const safeType = mimeType.replace(/_/g, '\\_').replace(/\*/g, '\\*');
 
-        ctx.editMessageText(`📄 *File Details*\n\n*Name:* ${safeName}\n*Size:* ${size}\n*Type:* ${safeType}`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }).catch((err: any) => {
+        ctx.editMessageText(`📄 *File Details*${isEncrypted ? ' 🔒 _(E2EE)_' : ''}\n\n*Name:* ${safeName}\n*Size:* ${size}\n*Type:* ${safeType}`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }).catch((err: any) => {
           console.error('Edit info error:', err);
           ctx.reply(`📄 *File Details*\n\nName: ${name}\nSize: ${size}\nType: ${mimeType}`, { reply_markup: { inline_keyboard: buttons } });
         });
@@ -927,69 +1019,93 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
       } else if (action === 'send_to_tg') {
         if (!account) throw new Error('Account not found');
         const statusMsg = await ctx.reply('⏳ *Preparing...*', { parse_mode: 'Markdown' });
-        const tmpPath   = `/tmp/send_${Date.now()}`;
+        const tmpPath   = path.join(os.tmpdir(), `send_${Date.now()}_${nanoid(6)}`);
         try {
-          let fileName = 'file', fileSize = 0, downloadStream: any;
+          let fileName = 'file', downloadStream: any;
           if (account.accountType === 'tgdrive') {
-            const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(id) });
+            if (!ObjectId.isValid(id)) throw new Error('Invalid file ID');
+            const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(id), accountId: account._id });
             if (!meta) throw new Error('File not found');
-            // Download from Telegram then re-send
+            if (meta.isEncrypted === true) throw new Error('Encrypted files must be downloaded in the app');
             const telegram = await getTgClient();
             const peer     = await resolvePeer(telegram, account.channelId);
             const msgs     = await telegram.getMessages(peer, { ids: [meta.messageId] });
             if (!msgs?.[0]?.media) throw new Error('Message not found');
-            fileName = meta.name; fileSize = meta.size;
+            fileName = meta.name;
             const ws = fs.createWriteStream(tmpPath);
-            for await (const chunk of telegram.iterDownload({ file: msgs[0].media as any, requestSize: 512 * 1024 })) ws.write(chunk);
-            await new Promise<void>((resolve, reject) => { ws.end(); ws.on('finish', resolve); ws.on('error', reject); });
+            try {
+              for await (const chunk of telegram.iterDownload({ file: msgs[0].media as any, requestSize: 512 * 1024 })) {
+                if (!ws.write(chunk)) {
+                  await new Promise<void>((resolve, reject) => {
+                    const onDrain = () => { cleanup(); resolve(); };
+                    const onErr = (e: any) => { cleanup(); reject(e); };
+                    const cleanup = () => { ws.off('drain', onDrain); ws.off('error', onErr); };
+                    ws.once('drain', onDrain);
+                    ws.once('error', onErr);
+                  });
+                }
+              }
+              ws.end();
+              await new Promise<void>((resolve, reject) => { ws.on('finish', resolve); ws.on('error', reject); });
+            } catch (e) {
+              ws.destroy();
+              throw e;
+            }
           } else {
+            const meta = await database.collection('tg_files').findOne({ accountId: account._id, providerFileId: String(id) });
+            if (meta?.isEncrypted === true) throw new Error('Encrypted files must be downloaded in the app');
             if (account.accountType === 'onedrive') {
               const c    = await getOneDriveClient(account.tokens, accId);
               const item = await c.api(`/me/drive/items/${id}`).get();
-              fileName = item.name; fileSize = item.size;
+              fileName = item.name;
               const dlUrl = item['@microsoft.graph.downloadUrl'];
+              if (!dlUrl) throw new Error('Download link not available');
               const r     = await axios.get(dlUrl, { responseType: 'stream' }); downloadStream = r.data;
             } else {
               const drive = await getDriveClient(account.tokens);
               const f     = await drive.files.get({ fileId: id, fields: 'name,size' });
-              fileName = f.data.name!; fileSize = Number(f.data.size || 0);
+              fileName = f.data.name!;
               const r  = await drive.files.get({ fileId: id, alt: 'media' }, { responseType: 'stream' }); downloadStream = r.data;
             }
             const ws = fs.createWriteStream(tmpPath);
-            for await (const chunk of downloadStream) ws.write(chunk);
-            await new Promise<void>((resolve, reject) => { ws.end(); ws.on('finish', resolve); ws.on('error', reject); });
+            await stream.promises.pipeline(downloadStream, ws);
           }
-        const tgc = await getTgClient();
-        await tgc.sendFile(String(ctx.chat.id), { file: tmpPath, caption: `✅ *${fileName}*`, forceDocument: true, attributes: [new Api.DocumentAttributeFilename({ fileName })] });
-        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+          const tgc = await getTgClient();
+          await tgc.sendFile(String(ctx.chat.id), { file: tmpPath, caption: `✅ *${fileName}*`, forceDocument: true, attributes: [new Api.DocumentAttributeFilename({ fileName })] });
           bot!.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
         } catch (err: any) {
-          if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
           bot!.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `❌ *Failed:* ${err.message}`, { parse_mode: 'Markdown' }).catch(() => {});
+        } finally {
+          if (fs.existsSync(tmpPath)) { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
         }
 
       } else if (action === 'rename') {
         if (!account) throw new Error('Account not found');
         botState[ctx.from.id] = { action: 'rename_prompt', data: { accId, fileId: id } };
         ctx.reply(`✏️ *Rename*\n\nSend the new name:`, { parse_mode: 'Markdown' });
-        ctx.answerCbQuery();
 
       } else if (action === 'delete') {
         if (!account) throw new Error('Account not found');
         if (account.accountType === 'tgdrive') {
-          const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(id) });
+          if (!ObjectId.isValid(id)) throw new Error('Invalid file ID');
+          const meta = await database.collection('tg_files').findOne({ _id: new ObjectId(id), accountId: account._id });
           if (meta) {
-            const telegram = await getTgClient();
-            const peer     = await resolvePeer(telegram, account.channelId);
-            try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* ignore */ }
-            await database.collection('tg_files').deleteOne({ _id: new ObjectId(id) });
+            const refCount = await database.collection('tg_files').countDocuments({ messageId: meta.messageId, accountId: account._id });
+            if (refCount <= 1) {
+              const telegram = await getTgClient();
+              const peer     = await resolvePeer(telegram, account.channelId);
+              try { await telegram.deleteMessages(peer, [meta.messageId], { revoke: true }); } catch { /* ignore */ }
+            }
+            await database.collection('tg_files').deleteOne({ _id: meta._id });
           }
         } else if (account.accountType === 'onedrive') {
           const c = await getOneDriveClient(account.tokens, accId); await c.api(`/me/drive/items/${id}`).delete();
+          await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(id) });
         } else {
           const drive = await getDriveClient(account.tokens); await drive.files.delete({ fileId: id });
+          await database.collection('tg_files').deleteMany({ accountId: account._id, providerFileId: String(id) });
         }
-        if (deleteThumbFiles) deleteThumbFiles(id);
+        if (deleteThumbFiles) deleteThumbFiles(id, accId);
         invalidateDriveCache(accId);
         ctx.answerCbQuery('✅ Deleted');
         ctx.editMessageText('🗑️ *File deleted.*', { parse_mode: 'Markdown' });
@@ -1005,14 +1121,13 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         ctx.editMessageText(`⚙️ *${label}*`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 
       } else if (action === 'mk_def') {
-        const userId = await getUserIdByTg(ctx.from!.id, database);
         await database.collection('accounts').updateMany({ userId }, { $set: { isDefault: false } });
         await database.collection('accounts').updateOne({ _id: new ObjectId(accId), userId }, { $set: { isDefault: true } });
         ctx.answerCbQuery('✅ Set as default');
         await renderSettings(ctx, true);
 
       } else if (action === 'rm_def') {
-        await database.collection('accounts').updateOne({ _id: new ObjectId(accId) }, { $set: { isDefault: false } });
+        await database.collection('accounts').updateOne({ _id: new ObjectId(accId), userId }, { $set: { isDefault: false } });
         ctx.answerCbQuery('✅ Default removed');
         await renderSettings(ctx, true);
 
@@ -1022,8 +1137,10 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         ctx.editMessageText(`⚠️ *Delete account* \`${label}\`?`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '✅ Yes, Delete', callback_data: getCb('rm_acc', accId, 'null') }], [{ text: '❌ Cancel', callback_data: getCb('sett_acc', accId, 'null') }]] } });
 
       } else if (action === 'rm_acc') {
-        const userId = await getUserIdByTg(ctx.from!.id, database);
         await database.collection('accounts').deleteOne({ _id: new ObjectId(accId), userId });
+        await database.collection('account_encryption_backups').deleteMany({ accountId: String(accId), userId: String(userId) });
+        await database.collection('upload_sessions').deleteMany({ accountId: String(accId), userId: String(userId) });
+        invalidateDriveCache(accId);
         ctx.answerCbQuery('✅ Account deleted');
         ctx.editMessageText('🗑️ *Account deleted.*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: getCb('settings_main', 'null', 'null') }]] } });
 
@@ -1031,7 +1148,6 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         await renderSettings(ctx, true);
 
       } else if (action === 'backup_settings') {
-        const userId   = await getUserIdByTg(ctx.from!.id, database);
         const user     = await database.collection('users').findOne({ _id: userId });
         const accounts = await database.collection('accounts').find({ userId }).toArray();
         const backupAcc = accounts.find((a: any) => a._id.toString() === user?.backupAccId);
@@ -1045,30 +1161,32 @@ async function renderAdminPanel(ctx: any, isEdit = false) {
         ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 
       } else if (action === 'toggle_backup') {
-        const userId = await getUserIdByTg(ctx.from!.id, database);
         const user = await database.collection('users').findOne({ _id: userId });
         await database.collection('users').updateOne({ _id: userId }, { $set: { backupEnabled: !user?.backupEnabled } });
         ctx.answerCbQuery('Updated'); await renderSettings(ctx, true);
 
       } else if (action === 'pick_backup') {
-        const userId = await getUserIdByTg(ctx.from!.id, database);
         const accounts = await database.collection('accounts').find({ userId }).toArray();
         const buttons  = accounts.map((acc: any) => ([{ text: acc.accountType === 'tgdrive' ? `📡 TG Drive (${acc.channelId})` : `📁 ${acc.email}`, callback_data: getCb('set_backup', acc._id.toString(), 'null') }]));
         buttons.push([{ text: '⬅️ Back', callback_data: getCb('backup_settings', 'null', 'null') }]);
         ctx.editMessageText('🎯 *Select backup account:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 
       } else if (action === 'set_backup') {
-        const userId = await getUserIdByTg(ctx.from!.id, database);
-        await database.collection('users').updateOne({ _id: userId }, { $set: { backupAccId: accId } });
+        const targetAcc = ObjectId.isValid(accId)
+          ? await database.collection('accounts').findOne({ _id: new ObjectId(accId), userId })
+          : null;
+        if (!targetAcc) return ctx.answerCbQuery('❌ Invalid account');
+        await database.collection('users').updateOne({ _id: userId }, { $set: { backupAccId: String(targetAcc._id) } });
         ctx.answerCbQuery('Backup account set'); await renderSettings(ctx, true);
         
       } else if (action === 'admin_panel') {
         await renderAdminPanel(ctx, true);
 
       } else if (action === 'toggle_reg') {
-        const userId = await getUserIdByTg(ctx.from!.id, database);
         const user = await database.collection('users').findOne({ _id: userId });
         if (!user?.isAdmin) return ctx.answerCbQuery('⛔ Access denied');
+        const allowedKeys = new Set(['registrationEnabled', 'webRegistrationEnabled', 'botRegistrationEnabled']);
+        if (!allowedKeys.has(accId)) return ctx.answerCbQuery('❌ Invalid setting key');
         
         const newValue = id === 'true';
         await database.collection('settings').updateOne(
