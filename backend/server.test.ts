@@ -14,7 +14,7 @@ import {
   validateKeyBackupInput,
   validateOpaqueFilename,
   computeFileSha256,
-} from './provider-transfer-protocol.ts';
+} from './protocol.ts';
 
 process.env.CLOUDYTE_TEST_MODE = '1';
 
@@ -27,6 +27,7 @@ const {
   runEncryptionMigration,
   TEMP_DIR,
 } = await import('./server.ts');
+const { clearTgChannelAccessCache, withTgPoolClient, getTgBotPoolStatus } = await import('./provider.ts');
 
 // ─── In-memory MongoDB Mock for Integration Tests ───────────────────────────
 function matchesQuery(doc: any, query: any): boolean {
@@ -1965,8 +1966,1004 @@ test('Cloudyte E2EE Backend Suite (Tests 1-39)', async (t) => {
     assert.equal(emptyOdTrashRes.status, 200);
     const emptyOdJson: any = await emptyOdTrashRes.json();
     assert.ok(emptyOdJson.deletedCount >= 1);
+
+    // 3. Personal Access Tokens (plaintext in DB, scope & account confinement enforcement)
+    const createPatRes = await apiFetch('/api/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Read-Only Confined Token',
+        scopes: ['read'],
+        accountId: String(tgAccount1Id),
+        expiresInDays: 7,
+      }),
+    });
+    assert.equal(createPatRes.status, 201);
+    const patData: any = await createPatRes.json();
+    assert.ok(patData.token.startsWith('pat_'));
+
+    // Read on confined account succeeds
+    const patReadOk = await fetch(`${baseUrl}/api/files?accountId=${String(tgAccount1Id)}`, {
+      headers: { Authorization: `Bearer ${patData.token}` },
+    });
+    assert.equal(patReadOk.status, 200);
+
+    // Read on a different account is blocked by account confinement (403)
+    const patReadWrongAcc = await fetch(`${baseUrl}/api/files?accountId=${String(gdAccount1Id)}`, {
+      headers: { Authorization: `Bearer ${patData.token}` },
+    });
+    assert.equal(patReadWrongAcc.status, 403);
+
+    // Write operation with read-only PAT is blocked by scope enforcement (403)
+    const patWriteDenied = await fetch(`${baseUrl}/api/folders`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${patData.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ accountId: String(tgAccount1Id), name: 'forbidden-folder' }),
+    });
+    assert.equal(patWriteDenied.status, 403);
+
+    // Revoking PAT immediately invalidates it
+    const revokePatRes = await apiFetch(`/api/tokens/${patData.tokenId}`, { method: 'DELETE' });
+    assert.equal(revokePatRes.status, 200);
+    const patAfterRevoke = await fetch(`${baseUrl}/api/files?accountId=${String(tgAccount1Id)}`, {
+      headers: { Authorization: `Bearer ${patData.token}` },
+    });
+    assert.equal(patAfterRevoke.status, 401);
+
+    // 4. 7-Point Public Share Validation (maxDownloads, PIN, revocation)
+    const sharedTgId = new ObjectId();
+    await mockDb.collection('tg_files').insertOne({
+      _id: sharedTgId,
+      accountId: tgAccount1Id,
+      userId: 'user_1',
+      messageId: 7771,
+      name: 'shared-report.pdf',
+      mimeType: 'application/pdf',
+      size: 12,
+      folder: '',
+      date: Math.floor(Date.now() / 1000),
+      isEncrypted: false,
+    });
+    const shareCreateRes = await apiFetch('/api/share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(sharedTgId),
+        maxDownloads: 1,
+        pin: '4321',
+      }),
+    });
+    assert.equal(shareCreateRes.status, 200);
+    const shareJson: any = await shareCreateRes.json();
+    assert.ok(shareJson.shareId);
+
+    // Accessing share page without PIN returns 403
+    const shareNoPin = await fetch(`${baseUrl}/s/${shareJson.shareId}`);
+    assert.equal(shareNoPin.status, 403);
+
+    // Accessing share page with valid PIN succeeds
+    const shareWithPin = await fetch(`${baseUrl}/s/${shareJson.shareId}?pin=4321`);
+    assert.equal(shareWithPin.status, 200);
+
+    // Revoking share blocks public access with 404/410
+    const revokeShareRes = await apiFetch(`/api/share/${shareJson.shareId}`, { method: 'DELETE' });
+    assert.equal(revokeShareRes.status, 200);
+    const shareAfterRevoke = await fetch(`${baseUrl}/s/${shareJson.shareId}?pin=4321`);
+    assert.ok(shareAfterRevoke.status === 404 || shareAfterRevoke.status === 410);
+
+    // 5. One-Time Download Tickets (using the uploaded raw-stream-test.txt which exists in mock tgMessages)
+    const uploadedRawDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'raw-stream-test.txt' });
+    assert.ok(uploadedRawDoc);
+    const ticketRes = await apiFetch('/api/download-tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(uploadedRawDoc._id),
+        singleUse: true,
+        ttlSeconds: 120,
+      }),
+    });
+    assert.equal(ticketRes.status, 201);
+    const ticketJson: any = await ticketRes.json();
+    assert.ok(ticketJson.ticket.startsWith('dlt_'));
+
+    const firstTicketDl = await fetch(`${baseUrl}/api/download/ticket/${ticketJson.ticket}`);
+    assert.equal(firstTicketDl.status, 200);
+    await firstTicketDl.arrayBuffer();
+
+    // Second use of single-use ticket must fail with 410
+    const secondTicketDl = await fetch(`${baseUrl}/api/download/ticket/${ticketJson.ticket}`);
+    assert.equal(secondTicketDl.status, 410);
+
+    // 6. Queue Health & Admin Audit Logs
+    const qHealthRes = await apiFetch('/api/jobs/health');
+    assert.equal(qHealthRes.status, 200);
+    const qHealth: any = await qHealthRes.json();
+    assert.equal(qHealth.ok, true);
+    assert.ok(qHealth.queues.cross_account_transfer);
+
+    const adminBasicAuth = Buffer.from('admin:password').toString('base64');
+    const auditRes = await fetch(`${baseUrl}/api/admin/audit-logs?limit=20`, {
+      headers: { Authorization: `Basic ${adminBasicAuth}` },
+    });
+    assert.equal(auditRes.status, 200);
+    const auditJson: any = await auditRes.json();
+    assert.ok(Array.isArray(auditJson.logs));
+    assert.ok(auditJson.logs.length > 0);
+  });
+
+  await t.test('56. Downloads preserve Content-Length (no gzip stripping), support HEAD probes, HTTP Range 206 resume, If-Range, and 416', async () => {
+    // Upload a compressible >1KB text/plain file (> compression default 1024B threshold) to prove compression bypass works
+    const payloadStr = Array.from({ length: 64 }, (_, i) => `CLOUDYTE-CHUNK-${String(i).padStart(2, '0')}-0123456789ABCDEF`).join('');
+    const payload = Buffer.from(payloadStr, 'utf8');
+    assert.ok(payload.length > 1500, 'Payload must exceed 1024-byte compression threshold');
+    const sha256 = crypto.createHash('sha256').update(payload).digest('hex');
+
+    const initRes = await apiFetch(`/api/upload-sessions/${String(tgAccount1Id)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'resumable-range-test.txt',
+        mimeType: 'text/plain',
+        totalBytes: payload.length,
+        chunkSize: payload.length,
+        folderId: 'root',
+        checksum: sha256,
+        idempotencyKey: `idem_range_test_${Date.now()}`,
+      }),
+    });
+    assert.equal(initRes.status, 201);
+    const { sessionId } = (await initRes.json()) as any;
+
+    const putChunkRes = await apiFetch(`/api/upload-sessions/${sessionId}/chunks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(payload.length),
+        'X-Chunk-Offset': '0',
+      },
+      body: payload,
+    });
+    assert.equal(putChunkRes.status, 200);
+
+    const completeRes = await apiFetch(`/api/upload-sessions/${sessionId}/complete`, { method: 'POST' });
+    assert.equal(completeRes.status, 200);
+
+    const fileDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'resumable-range-test.txt' });
+    assert.ok(fileDoc);
+
+    // 1. HEAD probe on a single-use ticket returns exact Content-Length & Accept-Ranges without burning the ticket
+    const oneTimeRes = await apiFetch('/api/download-tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(fileDoc._id),
+        singleUse: true,
+        ttlSeconds: 300,
+      }),
+    });
+    assert.equal(oneTimeRes.status, 201);
+    const { ticket: oneTimeTicket } = (await oneTimeRes.json()) as any;
+
+    const headOneTime = await fetch(`${baseUrl}/api/download/ticket/${oneTimeTicket}`, {
+      method: 'HEAD',
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(headOneTime.status, 200);
+    assert.equal(headOneTime.headers.get('content-length'), String(payload.length));
+    assert.equal(headOneTime.headers.get('accept-ranges'), 'bytes');
+    assert.equal(headOneTime.headers.get('content-encoding'), null);
+    assert.ok((headOneTime.headers.get('cache-control') || '').includes('no-transform'));
+
+    // First GET on single-use ticket still succeeds after HEAD probe
+    const getOneTime = await fetch(`${baseUrl}/api/download/ticket/${oneTimeTicket}`, {
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(getOneTime.status, 200);
+    assert.equal(getOneTime.headers.get('content-length'), String(payload.length));
+    assert.equal(getOneTime.headers.get('content-encoding'), null);
+    const oneTimeBody = Buffer.from(await getOneTime.arrayBuffer());
+    assert.equal(Buffer.compare(oneTimeBody, payload), 0);
+
+    // Second GET on single-use ticket is still rejected with 410
+    const replayOneTime = await fetch(`${baseUrl}/api/download/ticket/${oneTimeTicket}`);
+    assert.equal(replayOneTime.status, 410);
+
+    // 2. Resumable ticket (singleUse: false) supports multi-request byte-range resume, suffix ranges, If-Range, and 416
+    const resumableRes = await apiFetch('/api/download-tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(fileDoc._id),
+        singleUse: false,
+        ttlSeconds: 3600,
+      }),
+    });
+    assert.equal(resumableRes.status, 201);
+    const { ticket: resumableTicket } = (await resumableRes.json()) as any;
+
+    // Part 1: bytes=0-511
+    const part1Res = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=0-511', 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(part1Res.status, 206);
+    assert.equal(part1Res.headers.get('accept-ranges'), 'bytes');
+    assert.equal(part1Res.headers.get('content-range'), `bytes 0-511/${payload.length}`);
+    assert.equal(part1Res.headers.get('content-length'), '512');
+    assert.equal(part1Res.headers.get('content-encoding'), null);
+    const etag = part1Res.headers.get('etag');
+    assert.ok(etag);
+    const part1Buf = Buffer.from(await part1Res.arrayBuffer());
+    assert.equal(Buffer.compare(part1Buf, payload.subarray(0, 512)), 0);
+
+    // Part 2 (Resume from offset 512 with matching If-Range)
+    const part2Res = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=512-', 'If-Range': etag!, 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(part2Res.status, 206);
+    assert.equal(part2Res.headers.get('content-range'), `bytes 512-${payload.length - 1}/${payload.length}`);
+    assert.equal(part2Res.headers.get('content-length'), String(payload.length - 512));
+    const part2Buf = Buffer.from(await part2Res.arrayBuffer());
+    assert.equal(Buffer.compare(Buffer.concat([part1Buf, part2Buf]), payload), 0);
+
+    // Suffix byte-range: last 64 bytes
+    const suffixRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=-64' },
+    });
+    assert.equal(suffixRes.status, 206);
+    assert.equal(suffixRes.headers.get('content-range'), `bytes ${payload.length - 64}-${payload.length - 1}/${payload.length}`);
+    assert.equal(suffixRes.headers.get('content-length'), '64');
+    const suffixBuf = Buffer.from(await suffixRes.arrayBuffer());
+    assert.equal(Buffer.compare(suffixBuf, payload.subarray(payload.length - 64)), 0);
+
+    // Stale If-Range must fall back to full 200 OK instead of returning corrupt partial bytes
+    const staleIfRangeRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=0-127', 'If-Range': '"stale-etag-mismatch"' },
+    });
+    assert.equal(staleIfRangeRes.status, 200);
+    assert.equal(staleIfRangeRes.headers.get('content-length'), String(payload.length));
+    const staleBody = Buffer.from(await staleIfRangeRes.arrayBuffer());
+    assert.equal(Buffer.compare(staleBody, payload), 0);
+
+    // Out-of-bounds and malformed byte-range must return 416 Range Not Satisfiable
+    const oobRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: `bytes=${payload.length + 100}-${payload.length + 200}` },
+    });
+    assert.equal(oobRes.status, 416);
+    assert.equal(oobRes.headers.get('content-range'), `bytes */${payload.length}`);
+
+    const malformedRangeRes = await fetch(`${baseUrl}/api/download/ticket/${resumableTicket}`, {
+      headers: { Range: 'bytes=not-a-number' },
+    });
+    assert.equal(malformedRangeRes.status, 416);
+
+    // 3. Public share download supports HEAD + byte-range resume without double-counting HEAD or resume chunks
+    const shareRes = await apiFetch('/api/share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountId: String(tgAccount1Id),
+        fileId: String(fileDoc._id),
+        maxDownloads: 2,
+      }),
+    });
+    assert.equal(shareRes.status, 200);
+    const { shareId } = (await shareRes.json()) as any;
+
+    const publicHead = await fetch(`${baseUrl}/api/public/download/${shareId}`, {
+      method: 'HEAD',
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+    });
+    assert.equal(publicHead.status, 200);
+    assert.equal(publicHead.headers.get('content-length'), String(payload.length));
+    assert.equal(publicHead.headers.get('accept-ranges'), 'bytes');
+    assert.equal(publicHead.headers.get('content-encoding'), null);
+
+    const publicPart1 = await fetch(`${baseUrl}/api/public/download/${shareId}`, {
+      headers: { Range: 'bytes=0-511' },
+    });
+    assert.equal(publicPart1.status, 206);
+    assert.equal(publicPart1.headers.get('content-range'), `bytes 0-511/${payload.length}`);
+    assert.equal(publicPart1.headers.get('content-length'), '512');
+    const pubBuf1 = Buffer.from(await publicPart1.arrayBuffer());
+
+    const publicPart2 = await fetch(`${baseUrl}/api/public/download/${shareId}`, {
+      headers: { Range: 'bytes=512-' },
+    });
+    assert.equal(publicPart2.status, 206);
+    assert.equal(publicPart2.headers.get('content-range'), `bytes 512-${payload.length - 1}/${payload.length}`);
+    const pubBuf2 = Buffer.from(await publicPart2.arrayBuffer());
+    assert.equal(Buffer.compare(Buffer.concat([pubBuf1, pubBuf2]), payload), 0);
+
+    // Verify share downloadCount was only incremented once (HEAD + offset>0 resume chunk did not double-count)
+    const shareDoc = await mockDb.collection('shares').findOne({ shareId });
+    assert.equal(Number(shareDoc?.downloadCount || 0), 1);
+  });
+
+  await t.test('57. Telegram CHANNEL_INVALID surfaces clear 403 TG_CHANNEL_ACCESS_DENIED on downloads, tickets, and /api/accounts', async () => {
+    const fileDoc = await mockDb.collection('tg_files').findOne({ accountId: tgAccount1Id, name: 'resumable-range-test.txt' });
+    assert.ok(fileDoc);
+    const origGetMessages = mockTgClient.getMessages;
+    try {
+      mockTgClient.getMessages = async () => {
+        const rpcErr: any = new Error('400: CHANNEL_INVALID (caused by channels.GetChannels)');
+        rpcErr.code = 400;
+        rpcErr.errorMessage = 'CHANNEL_INVALID';
+        throw rpcErr;
+      };
+
+      // 1. Direct download returns 403 JSON with actionable message (not generic 500 Streaming error)
+      const dlRes = await apiFetch(`/api/download/${String(tgAccount1Id)}/${String(fileDoc._id)}`);
+      assert.equal(dlRes.status, 403);
+      const dlErr: any = await dlRes.json();
+      assert.equal(dlErr.code, 'TG_CHANNEL_ACCESS_DENIED');
+      assert.ok(String(dlErr.error || '').toLowerCase().includes('admin'));
+
+      // 2. /api/accounts immediately flags this TG Drive account with error: true and errorMessage
+      const accsRes = await apiFetch('/api/accounts');
+      assert.equal(accsRes.status, 200);
+      const accs: any[] = await accsRes.json();
+      const tgAcc = accs.find((a) => a.id === String(tgAccount1Id));
+      assert.ok(tgAcc);
+      assert.equal(tgAcc.error, true);
+      assert.equal(tgAcc.errorCode, 'TG_CHANNEL_ACCESS_DENIED');
+      assert.ok(String(tgAcc.errorMessage || '').toLowerCase().includes('channel'));
+
+      // 3. /api/download-tickets pre-checks channel access and returns 403 TG_CHANNEL_ACCESS_DENIED
+      const ticketRes = await apiFetch('/api/download-tickets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: String(tgAccount1Id),
+          fileId: String(fileDoc._id),
+          singleUse: false,
+          ttlSeconds: 3600,
+        }),
+      });
+      assert.equal(ticketRes.status, 403);
+      const ticketErr: any = await ticketRes.json();
+      assert.equal(ticketErr.code, 'TG_CHANNEL_ACCESS_DENIED');
+    } finally {
+      mockTgClient.getMessages = origGetMessages;
+      const tgAccDoc = await mockDb.collection('accounts').findOne({ _id: tgAccount1Id });
+      if (tgAccDoc?.channelId) clearTgChannelAccessCache(tgAccDoc.channelId);
+    }
+  });
+
+  await t.test('58. TG Drive JSON bulk import maps Forum Topics to folders, General topic to root, infers MIME, and skips duplicates', async () => {
+    const forumAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: forumAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100777888999',
+      name: 'Forum Archive Group',
+      email: 'Forum Group: -100777888999',
+      chatType: 'supergroup',
+      isForum: false,
+      createdAt: new Date(),
+    });
+
+    const payload = {
+      isForum: true,
+      topics: [
+        { threadId: 1, name: 'General' },
+        { threadId: 12, name: 'Movies' },
+        { topic_id: 45, title: 'Docs/Work' },
+      ],
+      files: [
+        {
+          messageId: 501,
+          threadId: 1,
+          name: 'readme.pdf',
+          size: 2048,
+          date: 1732000000,
+        },
+        {
+          message_id: 502,
+          topic_id: 12,
+          file_name: 'Interstellar.mkv',
+          file_size: 104857600,
+          date: '2026-01-15T10:00:00Z',
+          caption: '1080p',
+        },
+        {
+          messageId: 503,
+          threadId: 45,
+          name: 'report.zip',
+          size: 4096,
+          mime_type: 'application/zip',
+        },
+        {
+          // References a topic not pre-listed in topics[] -> should auto-create folder
+          messageId: 504,
+          threadId: 99,
+          topicName: 'Music',
+          name: 'track.mp3',
+          size: 512000,
+        },
+      ],
+    };
+
+    const importRes = await apiFetch(`/api/tgdrive/${String(forumAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(importRes.status, 200);
+    const importData: any = await importRes.json();
+    assert.equal(importData.success, true);
+    assert.equal(importData.isForum, true);
+    assert.equal(importData.importedTopics, 3); // Movies, Docs - Work, Music (General threadId=1 maps to root)
+    assert.equal(importData.importedFiles, 4);
+    assert.equal(importData.skippedDuplicates, 0);
+
+    // Re-importing the exact same JSON must be idempotent and skip all 4 duplicate messageIds
+    const reimportRes = await apiFetch(`/api/tgdrive/${String(forumAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(reimportRes.status, 200);
+    const reimportData: any = await reimportRes.json();
+    assert.equal(reimportData.importedFiles, 0);
+    assert.equal(reimportData.skippedDuplicates, 4);
+
+    // Verify /api/accounts reflects isForum: true and fileCount: 4
+    const accsRes = await apiFetch('/api/accounts');
+    assert.equal(accsRes.status, 200);
+    const accs: any[] = await accsRes.json();
+    const forumAcc = accs.find((a) => a.id === String(forumAccId));
+    assert.ok(forumAcc);
+    assert.equal(forumAcc.isForum, true);
+    assert.equal(forumAcc.fileCount, 4);
+
+    // Verify root listing contains General-topic file + 3 topic folders
+    const rootRes = await apiFetch(`/api/files?accountId=${String(forumAccId)}`);
+    assert.equal(rootRes.status, 200);
+    const rootItems: any[] = await rootRes.json();
+    const folderNames = rootItems.filter((i) => i.type === 'folder').map((i) => i.name).sort();
+    assert.deepEqual(folderNames, ['Docs - Work', 'Movies', 'Music']);
+    const rootFile = rootItems.find((i) => i.type !== 'folder' && i.name === 'readme.pdf');
+    assert.ok(rootFile);
+    assert.equal(rootFile.type, 'pdf');
+    assert.equal(rootFile.mimeType, 'application/pdf');
+
+    // Verify Movies topic folder listing returns Interstellar.mkv with inferred video/x-matroska MIME
+    const moviesRes = await apiFetch(`/api/files?accountId=${String(forumAccId)}&folderId=Movies`);
+    assert.equal(moviesRes.status, 200);
+    const moviesItems: any[] = await moviesRes.json();
+    assert.equal(moviesItems.length, 1);
+    assert.equal(moviesItems[0].name, 'Interstellar.mkv');
+    assert.equal(moviesItems[0].type, 'video');
+    assert.equal(moviesItems[0].mimeType, 'video/x-matroska');
+    assert.equal(moviesItems[0].sizeBytes, 104857600);
+  });
+
+  await t.test('59. TG Drive JSON bulk import converts text messages into .txt notes with full download, HEAD, and byte-range support', async () => {
+    const notesAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: notesAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100555666777',
+      name: 'Notes Forum Group',
+      email: 'Forum Group: -100555666777',
+      chatType: 'supergroup',
+      isForum: true,
+      createdAt: new Date(),
+    });
+
+    const sampleText = 'Deployment Checklist\n1. Add bot as admin\n2. Import JSON archive\n';
+    const expectedBytes = Buffer.byteLength(sampleText, 'utf8');
+
+    const importRes = await apiFetch(`/api/tgdrive/${String(notesAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        isForum: true,
+        topics: [{ threadId: 77, name: 'Guides' }],
+        files: [
+          {
+            messageId: 801,
+            threadId: 77,
+            text: sampleText,
+            date: 1732100000,
+          },
+          {
+            // Explicit note without inline text -> falls back to Telegram message.message on download
+            messageId: 802,
+            threadId: 77,
+            type: 'note',
+            name: 'Live Fetched Note',
+          },
+        ],
+      }),
+    });
+    assert.equal(importRes.status, 200);
+    const importBody: any = await importRes.json();
+    assert.equal(importBody.importedFiles, 2);
+
+    const listRes = await apiFetch(`/api/files?accountId=${String(notesAccId)}&folderId=Guides`);
+    assert.equal(listRes.status, 200);
+    const items: any[] = await listRes.json();
+    assert.equal(items.length, 2);
+
+    const note1 = items.find((i) => i.messageId === 801);
+    assert.ok(note1);
+    assert.equal(note1.name, 'Deployment Checklist.txt');
+    assert.equal(note1.mimeType, 'text/plain');
+    assert.equal(note1.type, 'doc');
+    assert.equal(note1.isNote, true);
+    assert.ok(String(note1.textPreview || '').includes('Deployment Checklist'));
+    assert.equal(note1.sizeBytes, expectedBytes);
+
+    const note2 = items.find((i) => i.messageId === 802);
+    assert.ok(note2);
+    assert.equal(note2.name, 'Live Fetched Note.txt');
+    assert.equal(note2.mimeType, 'text/plain');
+
+    // HEAD probe returns exact UTF-8 byte length and Accept-Ranges: bytes
+    const headRes = await apiFetch(`/api/download/${String(notesAccId)}/${note1.id}`, { method: 'HEAD' });
+    assert.equal(headRes.status, 200);
+    assert.equal(headRes.headers.get('content-length'), String(expectedBytes));
+    assert.equal(headRes.headers.get('accept-ranges'), 'bytes');
+    assert.ok((headRes.headers.get('content-type') || '').includes('text/plain'));
+
+    // Full download returns exact UTF-8 text
+    const fullRes = await apiFetch(`/api/download/${String(notesAccId)}/${note1.id}?preview=1`);
+    assert.equal(fullRes.status, 200);
+    assert.equal(await fullRes.text(), sampleText);
+
+    // Byte-range 206 partial request returns exact slice
+    const rangeRes = await apiFetch(`/api/download/${String(notesAccId)}/${note1.id}`, {
+      headers: { Range: 'bytes=0-9' },
+    });
+    assert.equal(rangeRes.status, 206);
+    assert.equal(rangeRes.headers.get('content-range'), `bytes 0-9/${expectedBytes}`);
+    assert.equal(await rangeRes.text(), sampleText.slice(0, 10));
+
+    // Live Telegram fallback when textContent was omitted in JSON
+    const origGetMessages = mockTgClient.getMessages;
+    try {
+      mockTgClient.getMessages = async () => [{ id: 802, message: 'Fetched straight from Telegram message text' }] as any;
+      const liveRes = await apiFetch(`/api/download/${String(notesAccId)}/${note2.id}?preview=1`);
+      assert.equal(liveRes.status, 200);
+      assert.equal(await liveRes.text(), 'Fetched straight from Telegram message text');
+    } finally {
+      mockTgClient.getMessages = origGetMessages;
+    }
+  });
+
+  await t.test('60. TG Drive JSON export returns topics, media, and notes in re-importable format', async () => {
+    const srcAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: srcAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100444333222',
+      name: 'Backup Export Drive',
+      email: 'Forum Group: -100444333222',
+      chatType: 'supergroup',
+      isForum: true,
+      createdAt: new Date(),
+    });
+
+    await apiFetch(`/api/tgdrive/${String(srcAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        isForum: true,
+        topics: [{ threadId: 21, name: 'Archives' }],
+        files: [
+          { messageId: 901, threadId: 21, name: 'backup.zip', size: 20480, mimeType: 'application/zip', date: 1732200000 },
+          { messageId: 902, threadId: 21, text: 'Important backup note', date: 1732200100 },
+        ],
+      }),
+    });
+
+    // Other user must not export this account
+    const deniedRes = await apiFetch(`/api/tgdrive/${String(srcAccId)}/export`, {}, token2);
+    assert.equal(deniedRes.status, 403);
+
+    const exportRes = await apiFetch(`/api/tgdrive/${String(srcAccId)}/export`);
+    assert.equal(exportRes.status, 200);
+    assert.ok((exportRes.headers.get('content-disposition') || '').includes('backup-export-drive-export.json'));
+    const exported: any = await exportRes.json();
+
+    assert.equal(exported.isForum, true);
+    assert.equal(exported.driveName, 'Backup Export Drive');
+    assert.equal(exported.topics.length, 1);
+    assert.equal(exported.topics[0].threadId, 21);
+    assert.equal(exported.topics[0].name, 'Archives');
+    assert.equal(exported.files.length, 2);
+    const exportedNote = exported.files.find((f: any) => f.messageId === 902);
+    assert.equal(exportedNote.isNote, true);
+    assert.equal(exportedNote.text, 'Important backup note');
+
+    // Round-trip: import exported JSON into a brand new TG Drive account
+    const dstAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: dstAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100444333223',
+      name: 'Restored Drive',
+      email: 'Forum Group: -100444333223',
+      chatType: 'supergroup',
+      isForum: false,
+      createdAt: new Date(),
+    });
+
+    const reimportRes = await apiFetch(`/api/tgdrive/${String(dstAccId)}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(exported),
+    });
+    assert.equal(reimportRes.status, 200);
+    const reimportData: any = await reimportRes.json();
+    assert.equal(reimportData.importedTopics, 1);
+    assert.equal(reimportData.importedFiles, 2);
+  });
+
+  await t.test('61. Multi-Bot Worker Pool handles FLOOD_WAIT cooldowns and per-channel ineligibility failover seamlessly', async () => {
+    const calls: string[] = [];
+    const mainClient = {
+      connected: true,
+      tag: 'main',
+    };
+    const worker1Client = {
+      connected: true,
+      tag: 'worker-1',
+    };
+    const worker2Client = {
+      connected: true,
+      tag: 'worker-2',
+    };
+
+    setTestDependencies({
+      tgWorkerPool: [
+        { id: 'main', role: 'main', client: mainClient },
+        { id: 'worker-1', role: 'worker', client: worker1Client },
+        { id: 'worker-2', role: 'worker', client: worker2Client },
+      ],
+    });
+
+    try {
+      // 1. Worker-1 hits FLOOD_WAIT_30; pool must immediately fail over to Worker-2 without failing caller
+      const res1 = await withTgPoolClient(
+        '-100777111000',
+        async (client, slotId) => {
+          calls.push(`op1:${slotId}`);
+          if (slotId === 'worker-1') {
+            const fw: any = new Error('FLOOD_WAIT_30');
+            fw.seconds = 30;
+            throw fw;
+          }
+          return { ok: true, slotId, tag: client.tag };
+        },
+        { preferWorker: true }
+      );
+      assert.equal(res1.ok, true);
+      assert.equal(res1.slotId, 'worker-2');
+
+      const statusAfterFlood = getTgBotPoolStatus();
+      assert.equal(statusAfterFlood.totalBots, 3);
+      assert.equal(statusAfterFlood.workerCount, 2);
+      assert.equal(statusAfterFlood.healthyBots, 2);
+      const w1Status = statusAfterFlood.bots.find((b) => b.id === 'worker-1');
+      assert.equal(w1Status?.coolingDown, true);
+      assert.ok((w1Status?.cooldownRemainingSec || 0) > 0);
+      // Ensure tokens are never exposed in pool status
+      assert.equal('token' in (w1Status as any), false);
+
+      // 2. Worker-2 is not an admin in private channel -100777222000 (CHANNEL_INVALID); pool remembers ineligibility and routes to main
+      const res2 = await withTgPoolClient(
+        '-100777222000',
+        async (_client, slotId) => {
+          calls.push(`op2:${slotId}`);
+          if (slotId === 'worker-2') {
+            const err: any = new Error('400: CHANNEL_INVALID');
+            err.errorMessage = 'CHANNEL_INVALID';
+            throw err;
+          }
+          return { ok: true, slotId };
+        },
+        { preferWorker: true }
+      );
+      assert.equal(res2.ok, true);
+      assert.equal(res2.slotId, 'main');
+
+      // 3. Subsequent call on the same private channel skips worker-2 directly and uses main
+      const res3 = await withTgPoolClient(
+        '-100777222000',
+        async (_client, slotId) => {
+          calls.push(`op3:${slotId}`);
+          return slotId;
+        },
+        { preferWorker: true }
+      );
+      assert.equal(res3, 'main');
+      assert.ok(!calls.includes('op3:worker-2'));
+    } finally {
+      setTestDependencies({ tgWorkerPool: null });
+    }
+  });
+
+  await t.test('62. GET /api/accounts/:accountId/manifest returns recursive folders/files for whole-drive Android downloads and enforces ownership', async () => {
+    const manifestAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: manifestAccId,
+      userId: user1Id,
+      accountType: 'tgdrive',
+      channelId: '-100555666777',
+      name: 'Android Sync Drive',
+      email: 'Channel: -100555666777',
+      createdAt: new Date(),
+    });
+
+    for (const folderDoc of [
+      { accountId: manifestAccId, name: 'Photos', path: 'Photos', parent: '' },
+      { accountId: manifestAccId, name: '2026', path: 'Photos/2026', parent: 'Photos' },
+      { accountId: manifestAccId, name: 'Docs', path: 'Docs', parent: '' },
+    ]) {
+      await mockDb.collection('tg_folders').insertOne(folderDoc);
+    }
+
+    for (const fileDoc of [
+      { accountId: manifestAccId, messageId: 1001, name: 'readme.txt', folder: '', size: 120, mimeType: 'text/plain', date: 1733000000, isNote: true, textContent: 'hello' },
+      { accountId: manifestAccId, messageId: 1002, name: 'trip.jpg', folder: 'Photos/2026', size: 4096, mimeType: 'image/jpeg', date: 1733000100 },
+      { accountId: manifestAccId, messageId: 1003, name: 'invoice.pdf', folder: 'Docs', size: 8192, mimeType: 'application/pdf', date: 1733000200 },
+      { accountId: manifestAccId, messageId: 1004, name: 'deleted.bin', folder: 'Docs', size: 999, mimeType: 'application/octet-stream', date: 1733000300, trashed: true },
+    ]) {
+      await mockDb.collection('tg_files').insertOne(fileDoc);
+    }
+
+    // Cross-user access must be denied
+    const denied = await apiFetch(`/api/accounts/${String(manifestAccId)}/manifest`, {}, token2);
+    assert.equal(denied.status, 403);
+
+    // Whole-drive manifest excludes trashed files and returns exact relative paths & byte totals
+    const res = await apiFetch(`/api/accounts/${String(manifestAccId)}/manifest`);
+    assert.equal(res.status, 200);
+    const manifest: any = await res.json();
+    assert.equal(manifest.accountId, String(manifestAccId));
+    assert.equal(manifest.driveName, 'Android Sync Drive');
+    assert.equal(manifest.totalFiles, 3);
+    assert.equal(manifest.totalBytes, 120 + 4096 + 8192);
+    assert.deepEqual(manifest.folders, ['Docs', 'Photos', 'Photos/2026']);
+    const relPaths = manifest.files.map((f: any) => f.relativePath).sort();
+    assert.deepEqual(relPaths, ['Docs/invoice.pdf', 'Photos/2026/trip.jpg', 'readme.txt']);
+
+    // Subfolder-scoped manifest returns relative paths inside Photos/
+    const subRes = await apiFetch(`/api/accounts/${String(manifestAccId)}/manifest?folderId=Photos`);
+    assert.equal(subRes.status, 200);
+    const subManifest: any = await subRes.json();
+    assert.equal(subManifest.totalFiles, 1);
+    assert.deepEqual(subManifest.folders, ['2026']);
+    assert.equal(subManifest.files[0].relativePath, '2026/trip.jpg');
+  });
+
+  await t.test('63. POST /api/transfers/drive executes server-side whole-drive copy & move with folder replication, TG->TG fast-copy, note clone, and conflict skip', async () => {
+    const srcDriveId = new ObjectId();
+    const dstDriveId = new ObjectId();
+    for (const accDoc of [
+      {
+        _id: srcDriveId,
+        userId: user1Id,
+        accountType: 'tgdrive',
+        channelId: '-100888111001',
+        name: 'Source TG Vault',
+        email: 'Channel: -100888111001',
+        createdAt: new Date(),
+      },
+      {
+        _id: dstDriveId,
+        userId: user1Id,
+        accountType: 'tgdrive',
+        channelId: '-100888111002',
+        name: 'Target TG Vault',
+        email: 'Channel: -100888111002',
+        createdAt: new Date(),
+      },
+    ]) {
+      await mockDb.collection('accounts').insertOne(accDoc);
+    }
+
+    await mockDb.collection('tg_folders').insertOne({
+      accountId: srcDriveId,
+      name: 'Work',
+      path: 'Work',
+      parent: '',
+    });
+
+    for (const fileDoc of [
+      {
+        accountId: srcDriveId,
+        messageId: 2001,
+        name: 'report.pdf',
+        folder: 'Work',
+        size: 5000,
+        mimeType: 'application/pdf',
+        date: 1733100000,
+      },
+      {
+        accountId: srcDriveId,
+        messageId: 2002,
+        name: 'meeting-notes.txt',
+        folder: 'Work',
+        size: 19,
+        mimeType: 'text/plain; charset=utf-8',
+        isNote: true,
+        textContent: 'Action items: ship!',
+        textPreview: 'Action items: ship!',
+        date: 1733100100,
+      },
+    ]) {
+      await mockDb.collection('tg_files').insertOne(fileDoc);
+    }
+
+    // Same-account root-to-root must be rejected with 400
+    const badRes = await apiFetch('/api/transfers/drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(srcDriveId),
+        targetAccountId: String(srcDriveId),
+        isMove: false,
+      }),
+    });
+    assert.equal(badRes.status, 400);
+
+    // Cross-user target account must be rejected with 403
+    const otherUserAccId = new ObjectId();
+    await mockDb.collection('accounts').insertOne({
+      _id: otherUserAccId,
+      userId: user2Id,
+      accountType: 'tgdrive',
+      channelId: '-100888999999',
+      name: 'Other User Vault',
+      email: 'Channel: -100888999999',
+      createdAt: new Date(),
+    });
+    const forbiddenRes = await apiFetch('/api/transfers/drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAccountId: String(srcDriveId),
+        targetAccountId: String(otherUserAccId),
+        isMove: false,
+      }),
+    });
+    assert.equal(forbiddenRes.status, 403);
+
+    // Mock GramJS ForwardMessages zero-bandwidth fast-copy
+    let forwardedCount = 0;
+    const origInvoke = (mockTgClient as any).invoke;
+    (mockTgClient as any).invoke = async () => {
+      forwardedCount++;
+      return { updates: [{ id: 9000 + forwardedCount }] };
+    };
+
+    try {
+      // 1. Whole-drive COPY with target subfolder & fast-copy
+      const copyRes = await apiFetch('/api/transfers/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceAccountId: String(srcDriveId),
+          targetAccountId: String(dstDriveId),
+          targetFolderId: 'Mirrored',
+          isMove: false,
+          conflictStrategy: 'skip',
+        }),
+      });
+      assert.equal(copyRes.status, 202);
+      const copyJson: any = await copyRes.json();
+      assert.ok(copyJson.jobId);
+
+      // Wait for worker completion
+      let jobState: any = null;
+      for (let i = 0; i < 40; i++) {
+        await runJobWorker();
+        const jRes = await apiFetch(`/api/jobs/${copyJson.jobId}`);
+        jobState = await jRes.json();
+        if (jobState.status === 'completed' || jobState.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(jobState.status, 'completed');
+      assert.equal(jobState.type, 'drive_transfer');
+      assert.equal(jobState.totalItems, 2);
+      assert.equal(jobState.itemsProcessed, 2);
+      assert.equal(forwardedCount, 1);
+
+      // Verify folders and files exist in destination under Mirrored/Work
+      const dstFolders = await mockDb.collection('tg_folders').find({ accountId: dstDriveId }).toArray();
+      assert.ok(dstFolders.some((f: any) => f.path === 'Mirrored/Work'));
+      const dstFiles = await mockDb.collection('tg_files').find({ accountId: dstDriveId }).toArray();
+      assert.equal(dstFiles.length, 2);
+      const dstPdf = dstFiles.find((f: any) => f.name === 'report.pdf');
+      assert.equal(dstPdf.folder, 'Mirrored/Work');
+      assert.equal(dstPdf.messageId, 9001);
+      const dstNote = dstFiles.find((f: any) => f.name === 'meeting-notes.txt');
+      assert.equal(dstNote.folder, 'Mirrored/Work');
+      assert.equal(dstNote.isNote, true);
+      assert.equal(dstNote.textContent, 'Action items: ship!');
+
+      // Source files remain untouched on COPY
+      const srcFilesAfterCopy = await mockDb.collection('tg_files').find({ accountId: srcDriveId }).toArray();
+      assert.equal(srcFilesAfterCopy.length, 2);
+
+      // 2. Re-running COPY with conflictStrategy='skip' must skip both existing files (zero duplicates)
+      const skipRes = await apiFetch('/api/transfers/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceAccountId: String(srcDriveId),
+          targetAccountId: String(dstDriveId),
+          targetFolderId: 'Mirrored',
+          isMove: false,
+          conflictStrategy: 'skip',
+        }),
+      });
+      assert.equal(skipRes.status, 202);
+      const skipJson: any = await skipRes.json();
+      let skipState: any = null;
+      for (let i = 0; i < 40; i++) {
+        await runJobWorker();
+        const jRes = await apiFetch(`/api/jobs/${skipJson.jobId}`);
+        skipState = await jRes.json();
+        if (skipState.status === 'completed' || skipState.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(skipState.status, 'completed');
+      const dstFilesAfterSkip = await mockDb.collection('tg_files').find({ accountId: dstDriveId }).toArray();
+      assert.equal(dstFilesAfterSkip.length, 2);
+
+      // 3. Whole-drive MOVE into 'MovedHere' transfers both files and removes them from source
+      const moveRes = await apiFetch('/api/transfers/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceAccountId: String(srcDriveId),
+          targetAccountId: String(dstDriveId),
+          targetFolderId: 'MovedHere',
+          isMove: true,
+          conflictStrategy: 'overwrite',
+        }),
+      });
+      assert.equal(moveRes.status, 202);
+      const moveJson: any = await moveRes.json();
+      let moveState: any = null;
+      for (let i = 0; i < 40; i++) {
+        await runJobWorker();
+        const jRes = await apiFetch(`/api/jobs/${moveJson.jobId}`);
+        moveState = await jRes.json();
+        if (moveState.status === 'completed' || moveState.status === 'failed') break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(moveState.status, 'completed');
+      assert.equal(moveState.isMove, true);
+      assert.equal(moveState.sourceDeleteApproved, true);
+
+      const srcFilesAfterMove = await mockDb.collection('tg_files').find({ accountId: srcDriveId }).toArray();
+      assert.equal(srcFilesAfterMove.length, 0);
+      const movedDstFiles = await mockDb.collection('tg_files').find({ accountId: dstDriveId, folder: 'MovedHere/Work' }).toArray();
+      assert.equal(movedDstFiles.length, 2);
+    } finally {
+      if (origInvoke) (mockTgClient as any).invoke = origInvoke;
+      else delete (mockTgClient as any).invoke;
+    }
   });
 });
+
 
 
 

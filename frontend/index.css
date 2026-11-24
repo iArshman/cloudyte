@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-brand: #2563eb;
+  --color-brand-dark: #1d4ed8;
+  --color-brand-darker: #1e3a8a;
+}
+
+:root {
+  --bg: #f8fafc;
+  --rail: #ffffff;
+  --sf: #ffffff;
+  --hover: #f1f5f9;
+  --bd: #e2e8f0;
+  --tx: #0f172a;
+  --sub: #64748b;
+  --sel: #eff6ff;
+  --pi: #dbeafe;
+  --pit: #1e3a8a;
+  --tr: #e2e8f0;
+  --gb: #ecfdf5;
+  --gt: #059669;
+  --ob: #eff6ff;
+  --ot: #2563eb;
+  --tb: #f0f9ff;
+  --tt: #0ea5e9;
+  --chip: #e2e8f0;
+  --chipt: #334155;
+  --tonal: #dbeafe;
+  --tonalt: #1d4ed8;
+}
+
+.dark {
+  --bg: #070b14;
+  --rail: #090e1a;
+  --sf: #0f172a;
+  --hover: #162033;
+  --bd: #1e293b;
+  --tx: #f1f5f9;
+  --sub: #94a3b8;
+  --sel: #172554;
+  --pi: #1e3a8a;
+  --pit: #dbeafe;
+  --tr: #1e293b;
+  --gb: #0d222d;
+  --gt: #34d399;
+  --ob: #121e3d;
+  --ot: #60a5fa;
+  --tb: #0e2138;
+  --tt: #38bdf8;
+  --chip: #1e293b;
+  --chipt: #cbd5e1;
+  --tonal: #1e293b;
+  --tonalt: #dbeafe;
+}
+
+@layer base {
+  body {
+    background-color: var(--bg);
+    color: var(--tx);
+    font-family: var(--font-sans);
+    @apply antialiased;
+  }
+
+  /* Custom Scrollbars */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-200 dark:bg-[#1C263D] rounded-full hover:bg-slate-300 dark:hover:bg-[#2A395B] transition-colors;
+  }
+
+  .no-scrollbar::-webkit-scrollbar,
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar,
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply bg-slate-200 dark:bg-slate-800 rounded-full hover:bg-slate-300 dark:hover:bg-slate-700 transition-colors;
+  }
+}

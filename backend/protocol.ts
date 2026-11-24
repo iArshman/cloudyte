@@ -539,3 +539,162 @@ export async function computeFileSha256(filePath: string, fsModule: typeof impor
   }
   return hash.digest('hex');
 }
+
+/**
+ * Normalizes a filename to Unicode NFC, strips control characters and path separators,
+ * and ensures a safe bounded length.
+ */
+export function normalizeSafeFilename(rawName: unknown, fallback = 'file'): string {
+  if (typeof rawName !== 'string' || !rawName.trim()) return fallback;
+  const nfc = rawName.normalize('NFC');
+  const cleaned = nfc
+    .replace(/[\x00-\x1f\x7f/\\]/g, '_')
+    .replace(/^\.+$/, '_')
+    .trim();
+  if (!cleaned) return fallback;
+  return cleaned.length > 255 ? cleaned.slice(0, 255) : cleaned;
+}
+
+/**
+ * Inspects the first bytes of a file or buffer to detect magic-byte MIME types
+ * and checks for suspicious nested archive flags.
+ */
+export async function sniffMagicMimeType(
+  filePath: string,
+  fsModule: typeof import('fs') = fs
+): Promise<{ detectedMime: string | null; isArchive: boolean; suspiciousArchive: boolean }> {
+  try {
+    const handle = await fsModule.promises.open(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(64);
+      const { bytesRead } = await handle.read(buf, 0, 64, 0);
+      if (bytesRead < 4) {
+        return { detectedMime: null, isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+        return { detectedMime: 'image/png', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+        return { detectedMime: 'image/jpeg', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) {
+        return { detectedMime: 'image/gif', isArchive: false, suspiciousArchive: false };
+      }
+      if (
+        bytesRead >= 12 &&
+        buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+        buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+      ) {
+        return { detectedMime: 'image/webp', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
+        return { detectedMime: 'application/pdf', isArchive: false, suspiciousArchive: false };
+      }
+      if (buf[0] === 0x50 && buf[1] === 0x4b && (buf[2] === 0x03 || buf[2] === 0x05) && (buf[3] === 0x04 || buf[3] === 0x06)) {
+        // Check ZIP local file header uncompressed vs compressed size ratio if present
+        let suspiciousArchive = false;
+        if (bytesRead >= 26 && buf[2] === 0x03 && buf[3] === 0x04) {
+          const compressedSize = buf.readUInt32LE(18);
+          const uncompressedSize = buf.readUInt32LE(22);
+          if (compressedSize > 0 && uncompressedSize / compressedSize > 200) {
+            suspiciousArchive = true;
+          }
+        }
+        return { detectedMime: 'application/zip', isArchive: true, suspiciousArchive };
+      }
+      if (buf[0] === 0x1f && buf[1] === 0x8b) {
+        return { detectedMime: 'application/gzip', isArchive: true, suspiciousArchive: false };
+      }
+      return { detectedMime: null, isArchive: false, suspiciousArchive: false };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return { detectedMime: null, isArchive: false, suspiciousArchive: false };
+  }
+}
+
+/**
+ * Builds a RFC 6266 / 5987 safe Content-Disposition header value.
+ */
+export function buildSafeContentDisposition(dispositionType: 'inline' | 'attachment', rawFilename: string): string {
+  const safeName = normalizeSafeFilename(rawFilename, 'download');
+  const asciiFallback = safeName.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(safeName);
+  return `${dispositionType}; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
+
+export type ParsedByteRange =
+  | { kind: 'none' }
+  | { kind: 'invalid' }
+  | { kind: 'range'; start: number; end: number; length: number; header: string };
+
+/**
+ * Strictly parses a single HTTP Range header (RFC 9110 §14.1.2).
+ * Supports `bytes=start-end`, `bytes=start-`, and `bytes=-suffix`.
+ * Rejects control characters, negative offsets, and unsatisfiable ranges.
+ */
+export function parseHttpByteRange(rawRange: unknown, totalSize: number): ParsedByteRange {
+  if (typeof rawRange !== 'string') return { kind: 'none' };
+  const trimmed = rawRange.trim();
+  if (!trimmed) return { kind: 'none' };
+  if (/[\r\n\x00-\x1f\x7f]/.test(trimmed)) return { kind: 'invalid' };
+  if (!/^bytes=/i.test(trimmed)) return { kind: 'none' };
+  if (!Number.isFinite(totalSize) || totalSize <= 0) return { kind: 'none' };
+
+  const spec = trimmed.slice(6).trim();
+  // Multi-range requests (comma-separated) fall back cleanly to full 200 OK per RFC 9110 §14.2
+  if (spec.includes(',')) return { kind: 'none' };
+
+  const match = spec.match(/^(\d*)-(\d*)$/);
+  if (!match) return { kind: 'invalid' };
+  const [, startStr, endStr] = match;
+  if (!startStr && !endStr) return { kind: 'invalid' };
+
+  let start: number;
+  let end: number;
+
+  if (!startStr) {
+    // Suffix byte range: bytes=-N (last N bytes)
+    const suffixLength = Number(endStr);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return { kind: 'invalid' };
+    start = Math.max(0, totalSize - suffixLength);
+    end = totalSize - 1;
+  } else {
+    start = Number(startStr);
+    if (!Number.isSafeInteger(start) || start < 0 || start >= totalSize) return { kind: 'invalid' };
+    if (!endStr) {
+      end = totalSize - 1;
+    } else {
+      const requestedEnd = Number(endStr);
+      if (!Number.isSafeInteger(requestedEnd) || requestedEnd < start) return { kind: 'invalid' };
+      end = Math.min(requestedEnd, totalSize - 1);
+    }
+  }
+
+  return {
+    kind: 'range',
+    start,
+    end,
+    length: end - start + 1,
+    header: `bytes=${start}-${end}`,
+  };
+}
+
+/**
+ * Checks RFC 9110 §13.1.5 If-Range precondition against the current entity tag.
+ * If If-Range is present and does not strongly match the current ETag, returns false
+ * so the server serves the complete 200 OK representation instead of corrupting a resume.
+ */
+export function shouldHonorRangeHeader(headers: Record<string, any> | undefined, etag: string): boolean {
+  const rawIfRange = headers?.['if-range'];
+  if (typeof rawIfRange !== 'string' || !rawIfRange.trim()) return true;
+  const ifRange = rawIfRange.trim();
+  if (ifRange.startsWith('W/')) return false;
+  if (ifRange.startsWith('"') && ifRange.endsWith('"')) {
+    return Boolean(etag) && ifRange === etag;
+  }
+  return true;
+}
+
+
